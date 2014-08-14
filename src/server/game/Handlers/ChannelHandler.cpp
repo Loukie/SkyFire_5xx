@@ -29,10 +29,12 @@ void WorldSession::HandleJoinChannel(WorldPacket& recvPacket)
     std::string channelName, password;
 
     recvPacket >> channelId;
-    uint8 unknown1 = recvPacket.ReadBit();   // unknowns
-    uint8 unknown2 = recvPacket.ReadBit();
-    channelLength = recvPacket.ReadBits(8);
-    passLength = recvPacket.ReadBits(8);
+
+    uint8 unknown1 = recvPacket.ReadBit();                  // unknown bit
+    channelLength = recvPacket.ReadBits(7);
+    passLength = recvPacket.ReadBits(7);
+    uint8 unknown2 = recvPacket.ReadBit();                  // unknown bit
+
     channelName = recvPacket.ReadString(channelLength);
     password = recvPacket.ReadString(passLength);
 
@@ -66,7 +68,7 @@ void WorldSession::HandleLeaveChannel(WorldPacket& recvPacket)
     uint32 unk;
     std::string channelName;
     recvPacket >> unk;                                      // channel id?
-    uint32 length = recvPacket.ReadBits(8);
+    uint32 length = recvPacket.ReadBits(7);
     channelName = recvPacket.ReadString(length);
 
     TC_LOG_DEBUG("chat.system", "CMSG_LEAVE_CHANNEL %s Channel: %s, unk1: %u",

@@ -27,6 +27,7 @@
 #include "BattlefieldWG.h"
 #include "Battleground.h"
 #include "BattlegroundMgr.h"
+#include "BattlePetMgr.h"
 #include "CellImpl.h"
 #include "Channel.h"
 #include "ChannelMgr.h"
@@ -79,6 +80,7 @@
 #include "World.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
+#include "WorldStateBuilder.h"
 #include "MovementStructures.h"
 #include "Config.h"
 
@@ -703,8 +705,10 @@ Player::Player(WorldSession* session): Unit(true), phaseMgr(this)
     m_regenTimer = 0;
     m_regenTimerCount = 0;
     m_holyPowerRegenTimerCount = 0;
+    m_chiPowerRegenTimerCount = 0;
     m_focusRegenTimerCount = 0;
     m_weaponChangeTimer = 0;
+    _readyCheckTimer = 0;
 
     m_zoneUpdateId = 0;
     m_zoneUpdateTimer = 0;
@@ -887,6 +891,7 @@ Player::Player(WorldSession* session): Unit(true), phaseMgr(this)
 
     m_achievementMgr = new AchievementMgr<Player>(this);
     m_reputationMgr = new ReputationMgr(this);
+    m_battlePetMgr = new BattlePetMgr(this);
 }
 
 Player::~Player()
@@ -919,6 +924,7 @@ Player::~Player()
     delete m_runes;
     delete m_achievementMgr;
     delete m_reputationMgr;
+    delete m_battlePetMgr;
 
     for (uint8 i = 0; i < VOID_STORAGE_MAX_SLOT; ++i)
         delete _voidStorageItems[i];
@@ -1021,7 +1027,7 @@ bool Player::Create(uint32 guidlow, CharacterCreateInfo* createInfo)
     SetUInt32Value(PLAYER_FIELD_GUILD_RANK_ID, 0);
     SetGuildLevel(0);
     SetUInt32Value(PLAYER_FIELD_GUILD_DELETE_DATE, 0);
-    SetUInt32Value(PLAYER_FIELD_VIRTUAL_PLAYER_REALM, sConfigMgr->GetIntDefault("RealmID", 0));
+    SetUInt32Value(PLAYER_FIELD_VIRTUAL_PLAYER_REALM, realmID);
 
     for (int i = 0; i < KNOWN_TITLES_SIZE; ++i)
         SetUInt64Value(PLAYER_FIELD_KNOWN_TITLES + i, 0);  // 0=disabled
@@ -1253,10 +1259,10 @@ void Player::SendMirrorTimer(MirrorTimerType Type, uint32 MaxValue, uint32 Curre
             StopMirrorTimer(Type);
         return;
     }
-    WorldPacket data(SMSG_START_MIRROR_TIMER, (21));
+    WorldPacket data(SMSG_START_MIRROR_TIMER, 21);
     data << (uint32)Type;
-    data << CurrentValue;
     data << MaxValue;
+    data << CurrentValue;
     data << Regen;
     data << (uint8)0;
     data << (uint32)0;                                      // spell id
@@ -1294,11 +1300,30 @@ uint32 Player::EnvironmentalDamage(EnviromentalDamage type, uint32 damage)
 
     DealDamageMods(this, damage, &absorb);
 
-    WorldPacket data(SMSG_ENVIRONMENTALDAMAGELOG, (21));
-    data << uint64(GetGUID());
-    data << uint8(type != DAMAGE_FALL_TO_VOID ? type : DAMAGE_FALL);
+    ObjectGuid Guid = GetGUID();
+
+    WorldPacket data(SMSG_ENVIRONMENTALDAMAGELOG, 9 + 1 + 4 + 1 + 4 + 4);
+    data.WriteBit(Guid[5]);
+    data.WriteBit(Guid[7]);
+    data.WriteBit(Guid[1]);
+    data.WriteBit(Guid[4]);
+    data.WriteBit(Guid[2]);
+    data.WriteBit(Guid[0]);
+    data.WriteBit(0); // Power Data
+    data.WriteBit(Guid[6]);
+    data.WriteBit(Guid[3]);
+
     data << uint32(damage);
+    data.WriteByteSeq(Guid[0]);
+    data.WriteByteSeq(Guid[7]);
+    data << uint8(type != DAMAGE_FALL_TO_VOID ? type : DAMAGE_FALL);
+    data.WriteByteSeq(Guid[6]);
+    data.WriteByteSeq(Guid[3]);
+    data.WriteByteSeq(Guid[5]);
     data << uint32(absorb);
+    data.WriteByteSeq(Guid[1]);
+    data.WriteByteSeq(Guid[2]);
+    data.WriteByteSeq(Guid[4]);
     data << uint32(resist);
     SendMessageToSet(&data, true);
 
@@ -1837,6 +1862,12 @@ void Player::Update(uint32 p_time)
     // group update
     SendUpdateToOutOfRangeGroupMembers();
 
+    if (_readyCheckTimer > 0)
+        if (p_time >= _readyCheckTimer)
+            ReadyCheckComplete();
+        else
+            _readyCheckTimer -= p_time;
+
     Pet* pet = GetPet();
     if (pet && !pet->IsWithinDistInMap(this, GetMap()->GetVisibilityRange()) && !pet->isPossessed())
     //if (pet && !pet->IsWithinDistInMap(this, GetMap()->GetVisibilityDistance()) && (GetCharmGUID() && (pet->GetGUID() != GetCharmGUID())))
@@ -1919,8 +1950,8 @@ bool Player::BuildEnumData(PreparedQueryResult result, ByteBuffer* dataBuffer, B
 
     ObjectGuid guid = MAKE_NEW_GUID(fields[0].GetUInt32(), 0, HIGHGUID_PLAYER);
     std::string name = fields[1].GetString();
-    uint8 plrRace = fields[2].GetUInt8();
-    uint8 plrClass = fields[3].GetUInt8();
+    uint8 playerRace = fields[2].GetUInt8();
+    uint8 playerClass = fields[3].GetUInt8();
     uint8 gender = fields[4].GetUInt8();
     uint8 skin = uint8(fields[5].GetUInt32() & 0xFF);
     uint8 face = uint8((fields[5].GetUInt32() >> 8) & 0xFF);
@@ -1971,7 +2002,7 @@ bool Player::BuildEnumData(PreparedQueryResult result, ByteBuffer* dataBuffer, B
     uint32 petLevel   = 0;
     uint32 petFamily  = 0;
     // show pet at selection character in character list only for non-ghost character
-    if (result && !(playerFlags & PLAYER_FLAGS_GHOST) && (plrClass == CLASS_WARLOCK || plrClass == CLASS_HUNTER || plrClass == CLASS_DEATH_KNIGHT))
+    if (result && !(playerFlags & PLAYER_FLAGS_GHOST) && (playerClass == CLASS_WARLOCK || playerClass == CLASS_HUNTER || playerClass == CLASS_DEATH_KNIGHT))
     {
         uint32 entry = fields[16].GetUInt32();
         CreatureTemplate const* creatureInfo = sObjectMgr->GetCreatureTemplate(entry);
@@ -1984,30 +2015,49 @@ bool Player::BuildEnumData(PreparedQueryResult result, ByteBuffer* dataBuffer, B
     }
 
     // Packet content flags
-    bitBuffer->WriteBit(guid[0]);
+
     bitBuffer->WriteBit(guildGuid[4]);
-    bitBuffer->WriteBit(guid[7]);
+    bitBuffer->WriteBit(guid[0]);
     bitBuffer->WriteBit(guildGuid[3]);
-    bitBuffer->WriteBit(guildGuid[7]);
-    bitBuffer->WriteBit(guid[5]);
-    bitBuffer->WriteBit(guid[4]);
-    bitBuffer->WriteBit(guid[6]);
-    bitBuffer->WriteBit(guildGuid[1]);
     bitBuffer->WriteBit(guid[3]);
-    bitBuffer->WriteBit(guid[2]);
-    bitBuffer->WriteBit(guildGuid[0]);
-    bitBuffer->WriteBit(guildGuid[2]);
-    bitBuffer->WriteBit(guid[1]);
-    bitBuffer->WriteBit(guildGuid[5]);
+    bitBuffer->WriteBit(guid[7]);
+    bitBuffer->WriteBit(0); // Can boost ?
     bitBuffer->WriteBit(atLoginFlags & AT_LOGIN_FIRST);
+    bitBuffer->WriteBit(guid[6]);
     bitBuffer->WriteBit(guildGuid[6]);
     bitBuffer->WriteBits(uint32(name.length()), 6);
+    bitBuffer->WriteBit(guid[1]);
+    bitBuffer->WriteBit(guildGuid[1]);
+    bitBuffer->WriteBit(guildGuid[0]);
+    bitBuffer->WriteBit(guid[4]);
+    bitBuffer->WriteBit(guildGuid[7]);
+    bitBuffer->WriteBit(guid[2]);
+    bitBuffer->WriteBit(guid[5]);
+    bitBuffer->WriteBit(guildGuid[2]);
+    bitBuffer->WriteBit(guildGuid[5]);
 
     // Character data
-    *dataBuffer << uint32(petLevel);                            // Pet level
-    *dataBuffer << uint8(level);                                // Level
+    *dataBuffer << uint32(0);                                   // UNK02 - might be swaped with UNK03
+
+    dataBuffer->WriteByteSeq(guid[1]);
+
+    *dataBuffer << uint8(slot);                                 // List order
+    *dataBuffer << uint8(hairStyle);                            // Hair style
+
     dataBuffer->WriteByteSeq(guildGuid[2]);
+    dataBuffer->WriteByteSeq(guildGuid[0]);
+    dataBuffer->WriteByteSeq(guildGuid[6]);
+
+    dataBuffer->append(name.c_str(), name.length());            // Name
+
     dataBuffer->WriteByteSeq(guildGuid[3]);
+
+    *dataBuffer << float(x);                                    // X
+    *dataBuffer << uint32(0);                                   // UNK00 new field - Boost fieldand the pet fields
+    *dataBuffer << uint8(face);                                 // Face
+    *dataBuffer << uint8(playerClass);                          // Class
+
+    dataBuffer->WriteByteSeq(guildGuid[5]);
 
     for (uint8 slot = 0; slot < INVENTORY_SLOT_BAG_END; ++slot)
     {
@@ -2036,45 +2086,53 @@ bool Player::BuildEnumData(PreparedQueryResult result, ByteBuffer* dataBuffer, B
             if (enchant)
                 break;
         }
-        
-        *dataBuffer << uint8(proto->InventoryType);
+
         *dataBuffer << uint32(enchant ? enchant->aura_id : 0);
+        *dataBuffer << uint8(proto->InventoryType);
         *dataBuffer << uint32(proto->DisplayInfoID);
     }
 
-    dataBuffer->WriteByteSeq(guildGuid[6]);
-    *dataBuffer << uint8(slot);                                 // List order
-    *dataBuffer << uint8(hairStyle);                            // Hair style
     *dataBuffer << uint32(customizationFlag);                   // Character customization flags
-    *dataBuffer << uint8(plrClass);                             // Class
-    dataBuffer->WriteByteSeq(guildGuid[7]);
-    dataBuffer->WriteByteSeq(guid[0]);
-    *dataBuffer << uint32(petFamily);                           // Pet family
-    dataBuffer->WriteByteSeq(guildGuid[1]);
+
     dataBuffer->WriteByteSeq(guid[3]);
-    dataBuffer->WriteByteSeq(guid[7]);
-    dataBuffer->WriteByteSeq(guid[2]);
-    dataBuffer->WriteByteSeq(guildGuid[5]);
-    *dataBuffer << uint8(gender);                               // Gender
-    *dataBuffer << uint32(petDisplayId);                        // Pet DisplayID
-    *dataBuffer << uint32(zone);                                // Zone id
-    dataBuffer->WriteByteSeq(guid[6]);
-    *dataBuffer << uint8(hairColor);                            // Hair color
-    *dataBuffer << uint8(facialHair);                           // Facial hair
-    dataBuffer->append(name.c_str(), name.length());            // Name
-    *dataBuffer << uint8(plrRace);                              // Race
-    dataBuffer->WriteByteSeq(guildGuid[4]);
-    *dataBuffer << uint8(skin);                                 // Skin
-    *dataBuffer << uint32(mapId);                               // Map Id
-    *dataBuffer << uint32(charFlags);                           // Character flags
-    *dataBuffer << float(y);                                    // Y
-    dataBuffer->WriteByteSeq(guildGuid[0]);
-    dataBuffer->WriteByteSeq(guid[4]);
-    dataBuffer->WriteByteSeq(guid[1]);
-    *dataBuffer << float(z);                                    // Z
     dataBuffer->WriteByteSeq(guid[5]);
-    *dataBuffer << uint8(face);                                 // Face
-    *dataBuffer << float(x);                                    // X
+
+    *dataBuffer << uint32(petFamily);                           // Pet family
+
+    dataBuffer->WriteByteSeq(guildGuid[4]);
+
+    *dataBuffer << uint32(mapId);                               // Map Id
+    *dataBuffer << uint8(playerRace);                           // Race
+    *dataBuffer << uint8(skin);                                 // Skin
+
+    dataBuffer->WriteByteSeq(guildGuid[1]);
+
+    *dataBuffer << uint8(level);                                // Level
+
+    dataBuffer->WriteByteSeq(guid[0]);
+    dataBuffer->WriteByteSeq(guid[2]);
+
+    *dataBuffer << uint8(hairColor);                            // Hair color
+    *dataBuffer << uint8(gender);                               // Gender
+    *dataBuffer << uint8(facialHair);                           // Facial hair
+
+    *dataBuffer << uint32(petLevel);                            // Pet level
+
+    dataBuffer->WriteByteSeq(guid[4]);
+    dataBuffer->WriteByteSeq(guid[7]);
+
+    *dataBuffer << float(y);                                    // Y
+    *dataBuffer << uint32(petDisplayId);                        // Pet DisplayID
+    *dataBuffer << uint32(0);                                   // UNK03 - might be swaped with UNK02 and the pet fields
+
+    dataBuffer->WriteByteSeq(guid[6]);
+
+    *dataBuffer << uint32(charFlags);                           // Character flags
+
+    dataBuffer->WriteByteSeq(guildGuid[7]);
+
+    *dataBuffer << uint32(zone);                                // Zone id
+    *dataBuffer << float(z);                                    // Z
 
     return true;
 }
@@ -2203,6 +2261,10 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
                 UnsummonPetTemporaryIfAny();
         }
 
+        if (TempSummon* tempSummon = GetBattlePetMgr()->GetCurrentSummon())
+            if (!tempSummon->IsWithinDist3d(x, y, z, GetMap()->GetVisibilityRange()))
+                GetBattlePetMgr()->UnSummonCurrentBattlePet(true);
+
         if (!(options & TELE_TO_NOT_LEAVE_COMBAT))
             CombatStop();
 
@@ -2286,6 +2348,8 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
             if (pet)
                 UnsummonPetTemporaryIfAny();
 
+            GetBattlePetMgr()->UnSummonCurrentBattlePet(true);
+
             // remove all dyn objects
             RemoveAllDynObjects();
 
@@ -2302,6 +2366,7 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
             {
                 // send transfer packets
                 WorldPacket data(SMSG_TRANSFER_PENDING, 4 + 4 + 4);
+
                 data.WriteBit(0);       // unknown
                 data.WriteBit(m_transport != NULL);
 
@@ -2309,6 +2374,7 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
 
                 if (m_transport)
                 {
+                    // Might be in wrong order
                     data << GetMapId();
                     data << m_transport->GetEntry();
                 }
@@ -2328,12 +2394,11 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
             if (!GetSession()->PlayerLogout())
             {
                 WorldPacket data(SMSG_NEW_WORLD, 4 + 4 + 4 + 4 + 4);
-                data << float(m_teleport_dest.GetPositionZ());
+                data << float(m_teleport_dest.GetPositionX());
                 data << uint32(mapid);
                 data << float(m_teleport_dest.GetPositionY());
+                data << float(m_teleport_dest.GetPositionZ());
                 data << float(m_teleport_dest.GetOrientation());
-                data << float(m_teleport_dest.GetPositionX());
-
                 GetSession()->SendPacket(&data);
                 SendSavedInstances();
             }
@@ -2450,7 +2515,9 @@ void Player::RemoveFromWorld()
         ///- Release charmed creatures, unsummon totems and remove pets/guardians
         StopCastingCharm();
         StopCastingBindSight();
+        GetBattlePetMgr()->UnSummonCurrentBattlePet(true);
         UnsummonPetTemporaryIfAny();
+
         sOutdoorPvPMgr->HandlePlayerLeaveZone(this, m_zoneUpdateId);
         sBattlefieldMgr->HandlePlayerLeaveZone(this, m_zoneUpdateId);
     }
@@ -2489,6 +2556,9 @@ void Player::RegenerateAll()
 
     if (getClass() == CLASS_PALADIN)
         m_holyPowerRegenTimerCount += m_regenTimer;
+
+    if (getClass() == CLASS_MONK)
+        m_chiPowerRegenTimerCount += m_regenTimer;
 
     if (getClass() == CLASS_HUNTER)
         m_focusRegenTimerCount += m_regenTimer;
@@ -2536,9 +2606,6 @@ void Player::RegenerateAll()
         if (getClass() == CLASS_DEATH_KNIGHT)
             Regenerate(POWER_RUNIC_POWER);
 
-        if (getClass() == CLASS_MONK)
-            Regenerate(POWER_CHI);
-
         m_regenTimerCount -= 2000;
     }
 
@@ -2546,6 +2613,12 @@ void Player::RegenerateAll()
     {
         Regenerate(POWER_HOLY_POWER);
         m_holyPowerRegenTimerCount -= 10000;
+    }
+
+    if (m_chiPowerRegenTimerCount >= 10000 && getClass() == CLASS_MONK)
+    {
+        Regenerate(POWER_CHI);
+        m_chiPowerRegenTimerCount -= 10000;
     }
 
     m_regenTimer = 0;
@@ -2599,7 +2672,7 @@ void Player::Regenerate(Powers power)
         case POWER_FOCUS:
             addvalue += (6.0f + CalculatePct(6.0f, rangedHaste)) * sWorld->getRate(RATE_POWER_FOCUS);
             break;
-        case POWER_ENERGY:                                              // Regenerate energy (rogue)
+        case POWER_ENERGY:                                              // Regenerate energy (rogue) & (monk)
             addvalue += ((0.01f * m_regenTimer) + CalculatePct(0.01f, meleeHaste)) * sWorld->getRate(RATE_POWER_ENERGY);
             break;
         case POWER_RUNIC_POWER:
@@ -2619,12 +2692,12 @@ void Player::Regenerate(Powers power)
         break;
         case POWER_RUNES:
             break;
-        case POWER_CHI:                                  // Regenerate chi (monk)
-            {
-                float ChiRate = sWorld->getRate(RATE_POWER_CHI);
-                addvalue = 20 * ChiRate;
-                break;
-            } 
+        case POWER_CHI:                                                 // Regenerate chi (monk)
+        {
+            if (!IsInCombat())
+            addvalue += -1.0f;      // remove 1 each 10 sec
+        }
+        break;
         case POWER_HEALTH:
             return;
         default:
@@ -3022,35 +3095,31 @@ void Player::SendLogXPGain(uint32 GivenXP, Unit* victim, uint32 BonusXP, bool re
 {
     ObjectGuid guid = victim ? victim->GetGUID() : 0;
 
-    WorldPacket data(SMSG_LOG_XPGAIN, 21); // guess size?
-    data.WriteBit(guid[4]);
-    data.WriteBit(guid[3]);
-    data.WriteBit(guid[7]);
-    data.WriteBit(guid[5]);
-    data.WriteBit(0);                                       // fake?
+    WorldPacket data(SMSG_LOG_XPGAIN, 1 + 1 + 8 + 4 + 4 + 4 + 1);
+    data.WriteBit(0);                                       // has XP
     data.WriteBit(guid[6]);
-    data.WriteBit(1);
+    data.WriteBit(guid[3]);
+    data.WriteBit(0);                                       // has group bonus
+    data.WriteBit(guid[0]);
+    data.WriteBit(guid[7]);
+    data.WriteBit(0);                                       // unknown
     data.WriteBit(guid[2]);
     data.WriteBit(guid[1]);
-    data.WriteBit(1);
-    data.WriteBit(guid[0]);
+    data.WriteBit(guid[5]);
+    data.WriteBit(guid[4]);
 
-    data.WriteByteSeq(guid[0]);
-
-    data << uint32(GivenXP);                                // experience without bonus
-    data << float(1);                                       // 1 - none 0 - 100% group bonus output
-
-    data.WriteByteSeq(guid[2]);
-
-    data << uint32(GivenXP + BonusXP);                      // given experience
-    data << uint8(recruitAFriend ? 1 : 0);                  // does the GivenXP include a RaF bonus?
-
+    data.WriteByteSeq(guid[7]);
     data.WriteByteSeq(guid[1]);
-    data.WriteByteSeq(guid[4]);
     data.WriteByteSeq(guid[3]);
     data.WriteByteSeq(guid[5]);
-    data.WriteByteSeq(guid[7]);
+    data.WriteByteSeq(guid[2]);
+    data << float(1);                                       // 1 - none 0 - 100% group bonus output
+    data.WriteByteSeq(guid[4]);
     data.WriteByteSeq(guid[6]);
+    data << uint32(GivenXP);                                // experience without bonus
+    data << uint32(GivenXP + BonusXP);                      // given experience
+    data.WriteByteSeq(guid[0]);
+    data << uint8(recruitAFriend ? 1 : 0);                  // does the GivenXP include a RaF bonus?
 
     GetSession()->SendPacket(&data);
 }
@@ -3132,18 +3201,22 @@ void Player::GiveLevel(uint8 level)
     sObjectMgr->GetPlayerClassLevelInfo(getClass(), level, basehp, basemana);
 
     // send levelup info to client
-    WorldPacket data(SMSG_LEVELUP_INFO, (4+4+MAX_POWERS_PER_CLASS*4+MAX_STATS*4));
-    data << uint32(level);
+    WorldPacket data(SMSG_LEVELUP_INFO, ((MAX_POWERS_PER_CLASS * 4) + 4 + 4 + (MAX_STATS * 4) + 4));
+
     data << uint32(int32(basehp) - int32(GetCreateHealth()));
-    // for (int i = 0; i < MAX_STORED_POWERS; ++i)          // Powers loop (0-10)
-    data << uint32(int32(basemana)   - int32(GetCreateMana()));
-    data << uint32(0);
-    data << uint32(0);
-    data << uint32(0);
-    data << uint32(0);
-    // end for
+
     for (uint8 i = STAT_STRENGTH; i < MAX_STATS; ++i)       // Stats loop (0-4)
         data << uint32(int32(info.stats[i]) - GetCreateStat(Stats(i)));
+
+    bool talent = false;
+
+    data << bool(talent);
+    data << uint32(level);
+    data << uint32(int32(basemana) - int32(GetCreateMana()));
+    data << uint32(0); //unk
+    data << uint32(0); //unk
+    data << uint32(0); //unk
+    data << uint32(0); //unk
 
     GetSession()->SendPacket(&data);
 
@@ -3341,13 +3414,11 @@ void Player::InitStatsForLevel(bool reapplyMods)
         SetFloatValue(PLAYER_FIELD_SPELL_CRIT_PERCENTAGE+i, 0.0f);
 
     SetFloatValue(PLAYER_FIELD_PARRY_PERCENTAGE, 0.0f);
-    SetFloatValue(PLAYER_FIELD_PLAYER_FLAGS, 0.0f);
+    SetFloatValue(PLAYER_FIELD_BLOCK_PERCENTAGE, 0.0f);
+    SetFloatValue(PLAYER_FIELD_DODGE_PERCENTAGE, 0.0f);
 
     // Static 30% damage blocked
     SetUInt32Value(PLAYER_FIELD_SHIELD_BLOCK, 30);
-
-    // Dodge percentage
-    SetFloatValue(PLAYER_FIELD_DODGE_PERCENTAGE, 0.0f);
 
     // set armor (resistance 0) to original value (create_agility*2)
     SetArmor(int32(m_createStats[STAT_AGILITY]*2));
@@ -3429,11 +3500,11 @@ void Player::SendInitialSpells()
     uint16 spellCount = 0;
 
     WorldPacket data(SMSG_INITIAL_SPELLS, (1+2+4*m_spells.size()+2+m_spellCooldowns.size()*(2+2+2+4+4)));
+    data.WriteBit(0);
 
     size_t bitPos = data.bitwpos();
-
     data.WriteBits(0, 22); // spell count placeholder
-    data.WriteBit(0);
+
     data.FlushBits();
 
     for (PlayerSpellMap::const_iterator itr = m_spells.begin(); itr != m_spells.end(); ++itr)
@@ -3508,17 +3579,14 @@ void Player::RemoveMail(uint32 id)
 
 void Player::SendMailResult(uint32 mailId, MailResponseType mailAction, MailResponseResult mailError, uint32 equipError, uint32 item_guid, uint32 item_count)
 {
-    WorldPacket data(SMSG_SEND_MAIL_RESULT, (4+4+4+(mailError == MAIL_ERR_EQUIP_ERROR?4:(mailAction == MAIL_ITEM_TAKEN?4+4:0))));
+    WorldPacket data(SMSG_SEND_MAIL_RESULT, 4 + 4 + 4 + 4 + 4 + 4);
     data << uint32(mailId);
-    data << uint32(mailAction);
+    data << uint32(equipError);
     data << uint32(mailError);
-    if (mailError == MAIL_ERR_EQUIP_ERROR)
-        data << uint32(equipError);
-    else if (mailAction == MAIL_ITEM_TAKEN)
-    {
-        data << uint32(item_guid);                         // item guid low?
-        data << uint32(item_count);                        // item count?
-    }
+    data << uint32(mailAction);
+    data << uint32(item_guid);
+    data << uint32(item_count);
+
     GetSession()->SendPacket(&data);
 }
 
@@ -3526,7 +3594,7 @@ void Player::SendNewMail()
 {
     // deliver undelivered mail
     WorldPacket data(SMSG_RECEIVED_MAIL, 4);
-    data << (uint32) 0;
+    data << float(0);
     GetSession()->SendPacket(&data);
 }
 
@@ -3624,7 +3692,7 @@ bool Player::AddTalent(uint32 spellId, uint8 spec, bool learning)
             return true;
         }
     }
-    else 
+    else
         itr->second->state = PLAYERSPELL_UNCHANGED;
 
     return false;
@@ -4038,8 +4106,8 @@ void Player::learnSpell(uint32 spell_id, bool dependent)
         WorldPacket data(SMSG_LEARNED_SPELL, 8);
         uint32 spellCount = 1;
 
-        data.WriteBit(0);
         data.WriteBits(spellCount, 22);
+        data.WriteBit(0);
 
         for (uint32 i = 0; i < spellCount; ++i)
             data << uint32(spell_id);
@@ -4468,7 +4536,7 @@ bool Player::ResetTalents(bool noCost, bool resetTalents, bool resetSpecializati
         return false;
 
     sScriptMgr->OnPlayerTalentsReset(this, noCost);
-    
+
     // not need after this call
     if (HasAtLoginFlag(AT_LOGIN_RESET_TALENTS))
         RemoveAtLoginFlag(AT_LOGIN_RESET_TALENTS, true);
@@ -4557,6 +4625,36 @@ bool Player::ResetTalents(bool noCost, bool resetTalents, bool resetSpecializati
     }
     */
 
+    return true;
+}
+
+bool Player::RemoveTalent(uint32 talentId)
+{
+    TalentEntry const* talent = sTalentStore.LookupEntry(talentId);
+    if (!talent)
+        return false;
+
+    uint32 spellId = talent->SpellId;
+
+    SpellInfo const* unlearnSpellProto = sSpellMgr->GetSpellInfo(spellId);
+
+    removeSpell(spellId, true);
+
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        if (unlearnSpellProto->Effects[i].TriggerSpell > 0 && unlearnSpellProto->Effects[i].Effect == SPELL_EFFECT_LEARN_SPELL)
+            removeSpell(unlearnSpellProto->Effects[i].TriggerSpell, true);
+
+    PlayerTalentMap::iterator itr = GetTalentMap(GetActiveSpec())->find(spellId);
+    if (itr != GetTalentMap(GetActiveSpec())->end())
+        itr->second->state = PLAYERSPELL_REMOVED;
+
+    // Needs to be executed orthewise the talents will be screwedsx
+    SQLTransaction trans = CharacterDatabase.BeginTransaction();
+    _SaveTalents(trans);
+    _SaveSpells(trans);
+    CharacterDatabase.CommitTransaction(trans);
+
+    SendTalentsInfoData();
     return true;
 }
 
@@ -4698,6 +4796,7 @@ TrainerSpellState Player::GetTrainerSpellState(TrainerSpell const* trainer_spell
         if (!trainer_spell->learnedSpell[i])
             continue;
         SpellInfo const* learnedSpellInfo = sSpellMgr->GetSpellInfo(trainer_spell->learnedSpell[i]);
+
         if (learnedSpellInfo && learnedSpellInfo->IsPrimaryProfessionFirstRank() && (GetFreePrimaryProfessionPoints() == 0))
             return TRAINER_SPELL_GREEN_DISABLED;
     }
@@ -5146,7 +5245,7 @@ void Player::BuildPlayerRepop()
 
 void Player::ResurrectPlayer(float restore_percent, bool applySickness)
 {
-    WorldPacket data(SMSG_DEATH_RELEASE_LOC, 4*4);          // remove spirit healer position
+    WorldPacket data(SMSG_DEATH_RELEASE_LOC, 4 * 4);          // remove spirit healer position
     data << uint32(-1);
     data << float(0);
     data << float(0);
@@ -5244,7 +5343,7 @@ void Player::KillPlayer()
     m_deathTimer = 6 * MINUTE * IN_MILLISECONDS;
 
     UpdateCorpseReclaimDelay();                             // dependent at use SetDeathPvP() call before kill
-    SendCorpseReclaimDelay();
+    //SendCorpseReclaimDelay();
 
     // don't create corpse at this moment, player might be falling
 
@@ -5564,10 +5663,10 @@ void Player::RepopAtGraveyard()
         TeleportTo(ClosestGrave->map_id, ClosestGrave->x, ClosestGrave->y, ClosestGrave->z, orientation ? *orientation : GetOrientation());
         if (isDead())                                        // not send if alive, because it used in TeleportTo()
         {
-            WorldPacket data(SMSG_DEATH_RELEASE_LOC, 4*4);  // show spirit healer position on minimap
+            WorldPacket data(SMSG_DEATH_RELEASE_LOC, 4 * 4);  // show spirit healer position on minimap
             data << ClosestGrave->map_id;
-            data << ClosestGrave->x;
             data << ClosestGrave->y;
+            data << ClosestGrave->x;
             data << ClosestGrave->z;
             GetSession()->SendPacket(&data);
         }
@@ -5769,13 +5868,12 @@ float Player::GetMeleeCritFromAgility()
     if (level > GT_MAX_LEVEL)
         level = GT_MAX_LEVEL;
 
-    GtChanceToMeleeCritBaseEntry const* critBase  = sGtChanceToMeleeCritBaseStore.LookupEntry(pclass-1);
+    GtChanceToMeleeCritBaseEntry const* critBase  = sGtChanceToMeleeCritBaseStore.LookupEntry((pclass-1)*GT_MAX_LEVEL + level-1);
     GtChanceToMeleeCritEntry     const* critRatio = sGtChanceToMeleeCritStore.LookupEntry((pclass-1)*GT_MAX_LEVEL + level-1);
     if (critBase == NULL || critRatio == NULL)
         return 0.0f;
 
-    float crit = critBase->base + GetStat(STAT_AGILITY)*critRatio->ratio;
-    return crit*100.0f;
+    return ((critBase->base * 100.0f) + GetStat(STAT_AGILITY) / critRatio->ratio);
 }
 
 void Player::GetDodgeFromAgility(float &diminishing, float &nondiminishing)
@@ -5783,17 +5881,17 @@ void Player::GetDodgeFromAgility(float &diminishing, float &nondiminishing)
     // Table for base dodge values
     const float dodge_base[MAX_CLASSES] =
     {
-         0.037580f, // Warrior
-         0.036520f, // Paladin
-        -0.054500f, // Hunter
-        -0.005900f, // Rogue
-         0.031830f, // Priest
-         0.036640f, // DK
-         0.016750f, // Shaman
-         0.034575f, // Mage
-         0.020350f, // Warlock
-         0.0f,      // ??
-         0.049510f  // Druid
+         3.7580f, // Warrior
+         3.6520f, // Paladin
+        -5.4500f, // Hunter
+        -0.5900f, // Rogue
+         3.1830f, // Priest
+         3.6640f, // DK
+         1.6750f, // Shaman
+         3.4575f, // Mage
+         2.0350f, // Warlock
+         5.6097f, // Monk
+         4.9510f  // Druid
     };
     // Crit/agility to dodge/agility coefficient multipliers; 3.2.0 increased required agility by 15%
     const float crit_to_dodge[MAX_CLASSES] =
@@ -5807,7 +5905,7 @@ void Player::GetDodgeFromAgility(float &diminishing, float &nondiminishing)
          1.60f/1.15f,    // Shaman
          1.00f/1.15f,    // Mage
          0.97f/1.15f,    // Warlock (?)
-         0.0f,           // ??
+         2.00f/1.15f,    // Monk
          2.00f/1.15f     // Druid
     };
 
@@ -5818,17 +5916,21 @@ void Player::GetDodgeFromAgility(float &diminishing, float &nondiminishing)
         level = GT_MAX_LEVEL;
 
     // Dodge per agility is proportional to crit per agility, which is available from DBC files
-    GtChanceToMeleeCritEntry  const* dodgeRatio = sGtChanceToMeleeCritStore.LookupEntry((pclass-1)*GT_MAX_LEVEL + level-1);
+    GtChanceToMeleeCritEntry const* dodgeRatio = sGtChanceToMeleeCritStore.LookupEntry((pclass-1)*GT_MAX_LEVEL + (level - 1));
     if (dodgeRatio == NULL || pclass > MAX_CLASSES)
         return;
 
-    /// @todo research if talents/effects that increase total agility by x% should increase non-diminishing part
+    // TODO: research if talents/effects that increase total agility by x% should increase non-diminishing part
     float base_agility = GetCreateStat(STAT_AGILITY) * m_auraModifiersGroup[UNIT_MOD_STAT_START + STAT_AGILITY][BASE_PCT];
     float bonus_agility = GetStat(STAT_AGILITY) - base_agility;
 
+    float dodge_ratio = 1 / dodgeRatio->ratio;
+    if(pclass == CLASS_DEATH_KNIGHT || pclass == CLASS_PALADIN || pclass == CLASS_WARRIOR) dodge_ratio = 0;
+
     // calculate diminishing (green in char screen) and non-diminishing (white) contribution
-    diminishing = 100.0f * bonus_agility * dodgeRatio->ratio * crit_to_dodge[pclass-1];
-    nondiminishing = 100.0f * (dodge_base[pclass-1] + base_agility * dodgeRatio->ratio * crit_to_dodge[pclass-1]);
+    diminishing = bonus_agility * dodge_ratio * crit_to_dodge[pclass-1];
+    nondiminishing = dodge_base[pclass-1] + base_agility * dodge_ratio * crit_to_dodge[pclass-1];
+
 }
 
 float Player::GetSpellCritFromIntellect()
@@ -5839,13 +5941,12 @@ float Player::GetSpellCritFromIntellect()
     if (level > GT_MAX_LEVEL)
         level = GT_MAX_LEVEL;
 
-    GtChanceToSpellCritBaseEntry const* critBase = sGtChanceToSpellCritBaseStore.LookupEntry(pclass - 1);
+    GtChanceToSpellCritBaseEntry const* critBase = sGtChanceToSpellCritBaseStore.LookupEntry((pclass - 1) * GT_MAX_LEVEL + level - 1);
     GtChanceToSpellCritEntry const* critRatio = sGtChanceToSpellCritStore.LookupEntry((pclass - 1) * GT_MAX_LEVEL + level - 1);
     if (critBase == NULL || critRatio == NULL)
         return 0.0f;
 
-    float crit = critBase->base + GetStat(STAT_INTELLECT) * critRatio->ratio;
-    return crit * 100.0f;
+    return ((critBase->base * 100.0f) + GetStat(STAT_INTELLECT) / critRatio->ratio);
 }
 
 float Player::GetRatingMultiplier(CombatRating cr) const
@@ -6603,51 +6704,52 @@ void Player::SendActionButtons(uint32 state) const
         buttonsTab[i].unk = uint32(ab->GetType());
     }
 
-    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
-        data.WriteBit(buttons[i][2]);
-
-    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
-        data.WriteBit(buttons[i][7]);
-
-    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
-        data.WriteBit(buttons[i][3]);
-
-    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
-        data.WriteBit(buttons[i][0]);
-
-    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
-        data.WriteBit(buttons[i][6]);
-
-    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
-        data.WriteBit(buttons[i][1]);
-
+    // Bits
     for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
         data.WriteBit(buttons[i][4]);
 
     for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
         data.WriteBit(buttons[i][5]);
 
+    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
+        data.WriteBit(buttons[i][3]);
 
     for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
-        data.WriteByteSeq(buttons[i][7]);
+        data.WriteBit(buttons[i][1]);
 
+    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
+        data.WriteBit(buttons[i][6]);
+
+    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
+        data.WriteBit(buttons[i][7]);
+
+    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
+        data.WriteBit(buttons[i][0]);
+
+    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
+        data.WriteBit(buttons[i][2]);
+
+    // Data
     for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
         data.WriteByteSeq(buttons[i][0]);
-
-    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
-        data.WriteByteSeq(buttons[i][6]);
-
-    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
-        data.WriteByteSeq(buttons[i][5]);
 
     for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
         data.WriteByteSeq(buttons[i][1]);
 
     for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
+        data.WriteByteSeq(buttons[i][4]);
+
+    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
+        data.WriteByteSeq(buttons[i][6]);
+
+    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
+        data.WriteByteSeq(buttons[i][7]);
+
+    for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
         data.WriteByteSeq(buttons[i][2]);
 
     for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
-        data.WriteByteSeq(buttons[i][4]);
+        data.WriteByteSeq(buttons[i][5]);
 
     for (uint8 i = 0; i < MAX_ACTION_BUTTONS; ++i)
         data.WriteByteSeq(buttons[i][3]);
@@ -7359,8 +7461,8 @@ void Player::SendNewCurrency(uint32 id) const
         return;
 
     ByteBuffer currencyData;
-    WorldPacket packet(SMSG_INIT_CURRENCY, 4 + (5*4 + 1));
-    packet.WriteBits(1, 23);
+    WorldPacket packet(SMSG_INIT_CURRENCY, 3 + 1 + 4 + 4 + 4 + 4);
+    packet.WriteBits(1, 21);
 
     CurrencyTypesEntry const* entry = sCurrencyTypesStore.LookupEntry(id);
     if (!entry) // should never happen
@@ -7369,22 +7471,25 @@ void Player::SendNewCurrency(uint32 id) const
     uint32 precision = (entry->Flags & CURRENCY_FLAG_HIGH_PRECISION) ? CURRENCY_PRECISION : 1;
     uint32 weekCount = itr->second.weekCount / precision;
     uint32 weekCap = GetCurrencyWeekCap(entry) / precision;
+    uint32 seasonCount = 0;
 
-    packet.WriteBit(weekCount);
-    packet.WriteBits(0, 4); // some flags
+    packet.WriteBit(seasonCount);
+    packet.WriteBits(0, 5); // some flags
     packet.WriteBit(weekCap);
-    packet.WriteBit(0);     // season total earned
+    packet.WriteBit(weekCount);
 
-    currencyData << uint32(itr->second.totalCount / precision);
-    if (weekCap)
-        currencyData << uint32(weekCap);
-
-    //if (seasonTotal)
-    //    currencyData << uint32(seasonTotal / precision);
-
-    currencyData << uint32(entry->ID);
     if (weekCount)
         currencyData << uint32(weekCount);
+
+    currencyData << uint32(entry->ID);
+
+    if (seasonCount)
+        currencyData << uint32(seasonCount);
+
+    currencyData << uint32(itr->second.totalCount / precision);
+
+    if (weekCap)
+        currencyData << uint32(weekCap);
 
     packet.FlushBits();
     packet.append(currencyData);
@@ -7394,9 +7499,9 @@ void Player::SendNewCurrency(uint32 id) const
 void Player::SendCurrencies() const
 {
     ByteBuffer currencyData;
-    WorldPacket packet(SMSG_INIT_CURRENCY, 4 + _currencyStorage.size()*(5*4 + 1));
+    WorldPacket packet(SMSG_INIT_CURRENCY, 3 + (_currencyStorage.size() * (1 + 4 + 4 + 4 + 4)));
     size_t count_pos = packet.bitwpos();
-    packet.WriteBits(_currencyStorage.size(), 23);
+    packet.WriteBits(_currencyStorage.size(), 21);
 
     size_t count = 0;
     for (PlayerCurrenciesMap::const_iterator itr = _currencyStorage.begin(); itr != _currencyStorage.end(); ++itr)
@@ -7410,43 +7515,49 @@ void Player::SendCurrencies() const
         uint32 precision = (entry->Flags & CURRENCY_FLAG_HIGH_PRECISION) ? CURRENCY_PRECISION : 1;
         uint32 weekCount = itr->second.weekCount / precision;
         uint32 weekCap = GetCurrencyWeekCap(entry) / precision;
+        uint32 seasonCount = 0;
 
-        packet.WriteBit(weekCount);
-        packet.WriteBits(0, 4); // some flags
+        packet.WriteBit(seasonCount);
+        packet.WriteBits(0, 5); // some flags
         packet.WriteBit(weekCap);
-        packet.WriteBit(0);     // season total earned
+        packet.WriteBit(weekCount);
 
-        currencyData << uint32(itr->second.totalCount / precision);
-        if (weekCap)
-            currencyData << uint32(weekCap);
-
-        //if (seasonTotal)
-        //    currencyData << uint32(seasonTotal / precision);
-
-        currencyData << uint32(entry->ID);
         if (weekCount)
             currencyData << uint32(weekCount);
+
+        currencyData << uint32(entry->ID);
+
+        if (seasonCount)
+            currencyData << uint32(seasonCount);
+
+        currencyData << uint32(itr->second.totalCount / precision);
+
+        if (weekCap)
+            currencyData << uint32(weekCap);
 
         ++count;
     }
 
     packet.FlushBits();
     packet.append(currencyData);
-    packet.PutBits(count_pos, count, 23);
+    packet.PutBits(count_pos, count, 21);
     GetSession()->SendPacket(&packet);
 }
 
 void Player::SendPvpRewards() const
 {
-    WorldPacket packet(SMSG_REQUEST_PVP_REWARDS_RESPONSE, 24);
-    packet << GetCurrencyWeekCap(CURRENCY_TYPE_CONQUEST_POINTS, true);
-    packet << GetCurrencyOnWeek(CURRENCY_TYPE_CONQUEST_POINTS, true);
-    packet << GetCurrencyWeekCap(CURRENCY_TYPE_CONQUEST_META_ARENA, true);
-    packet << GetCurrencyOnWeek(CURRENCY_TYPE_CONQUEST_META_ARENA, true);
-    packet << GetCurrencyOnWeek(CURRENCY_TYPE_CONQUEST_META_RBG, true);
-    packet << GetCurrencyWeekCap(CURRENCY_TYPE_CONQUEST_POINTS, true);
-    packet << GetCurrencyWeekCap(CURRENCY_TYPE_CONQUEST_META_RBG, true);
-    GetSession()->SendPacket(&packet);
+    WorldPacket data(SMSG_REQUEST_PVP_REWARDS_RESPONSE, 24);
+    data << GetCurrencyWeekCap(CURRENCY_TYPE_CONQUEST_POINTS, true);
+    data << GetCurrencyOnWeek(CURRENCY_TYPE_CONQUEST_META_ARENA, true);
+    data << GetCurrencyOnWeek(CURRENCY_TYPE_CONQUEST_META_RBG, true);
+    data << GetCurrencyOnWeek(CURRENCY_TYPE_CONQUEST_META_ARENA, true);
+    data << uint32(0); // UnkMop
+    data << GetCurrencyWeekCap(CURRENCY_TYPE_CONQUEST_META_ARENA, true);
+    data << uint32(0); // unkMop2
+    data << GetCurrencyWeekCap(CURRENCY_TYPE_CONQUEST_META_RBG, true);
+    data << GetCurrencyOnWeek(CURRENCY_TYPE_CONQUEST_POINTS, true);
+    data << GetCurrencyWeekCap(CURRENCY_TYPE_CONQUEST_META_ARENA, true);
+    GetSession()->SendPacket(&data);
 }
 
 uint32 Player::GetCurrency(uint32 id, bool usePrecision) const
@@ -8001,8 +8112,9 @@ void Player::DuelComplete(DuelCompleteType type)
 
     TC_LOG_DEBUG("entities.unit", "Duel Complete %s %s", GetName().c_str(), duel->opponent->GetName().c_str());
 
-    WorldPacket data(SMSG_DUEL_COMPLETE, (1));
-    data << (uint8)((type != DUEL_INTERRUPTED) ? 1 : 0);
+    WorldPacket data(SMSG_DUEL_COMPLETE, 1);
+    data.WriteBit(type != DUEL_INTERRUPTED);
+    data.FlushBits();
     GetSession()->SendPacket(&data);
 
     if (duel->opponent->GetSession())
@@ -8010,10 +8122,14 @@ void Player::DuelComplete(DuelCompleteType type)
 
     if (type != DUEL_INTERRUPTED)
     {
-        data.Initialize(SMSG_DUEL_WINNER, (1+20));          // we guess size
-        data << uint8(type == DUEL_WON ? 0 : 1);            // 0 = just won; 1 = fled
-        data << duel->opponent->GetName();
-        data << GetName();
+        data.Initialize(SMSG_DUEL_WINNER, 1 + 20);          // we guess size
+        data.WriteBit(type != DUEL_WON);                    // 0 = just won; 1 = fled
+        data.WriteBits(duel->opponent->GetName().length(), 6);
+        data.WriteBits(GetName().length(), 6);
+        data << uint32(realmID);
+        data.WriteString(duel->opponent->GetName());
+        data << uint32(realmID);
+        data.WriteString(GetName());
         SendMessageToSet(&data, true);
     }
 
@@ -8789,6 +8905,17 @@ void Player::CastItemUseSpell(Item* item, SpellCastTargets const& targets, uint8
             return;
         }
 
+        for (BattlePetItemXSpeciesStore::iterator itr = sBattlePetItemXSpeciesStore.begin(); itr != sBattlePetItemXSpeciesStore.end(); itr++)
+        {
+            if (itr->first != item->GetEntry())
+                continue;
+
+            m_battlePetMgr->Create(itr->second);
+            learning_spell_id = 0;
+
+            break;
+        }
+
         Spell* spell = new Spell(this, spellInfo, TRIGGERED_NONE);
         spell->m_CastItem = item;
         spell->m_cast_count = cast_count;                   //set count of casts
@@ -9002,10 +9129,44 @@ void Player::RemovedInsignia(Player* looterPlr)
     looterPlr->SendLoot(bones->GetGUID(), LOOT_INSIGNIA);
 }
 
-void Player::SendLootRelease(uint64 guid)
+void Player::SendLootRelease(ObjectGuid guid)
 {
-    WorldPacket data(SMSG_LOOT_RELEASE_RESPONSE, (8+1));
-    data << uint64(guid) << uint8(1);
+    ObjectGuid lootGuid = guid;
+
+    WorldPacket data(SMSG_LOOT_RELEASE_RESPONSE, 20);
+    data.WriteBit(lootGuid[0]);
+    data.WriteBit(lootGuid[7]);
+    data.WriteBit(lootGuid[5]);
+    data.WriteBit(guid[0]);
+    data.WriteBit(lootGuid[4]);
+    data.WriteBit(lootGuid[6]);
+    data.WriteBit(guid[1]);
+    data.WriteBit(lootGuid[2]);
+    data.WriteBit(guid[5]);
+    data.WriteBit(lootGuid[3]);
+    data.WriteBit(guid[3]);
+    data.WriteBit(guid[2]);
+    data.WriteBit(guid[4]);
+    data.WriteBit(lootGuid[1]);
+    data.WriteBit(guid[6]);
+    data.WriteBit(guid[7]);
+
+    data.WriteByteSeq(guid[1]);
+    data.WriteByteSeq(lootGuid[1]);
+    data.WriteByteSeq(guid[2]);
+    data.WriteByteSeq(guid[5]);
+    data.WriteByteSeq(lootGuid[5]);
+    data.WriteByteSeq(lootGuid[7]);
+    data.WriteByteSeq(lootGuid[3]);
+    data.WriteByteSeq(guid[0]);
+    data.WriteByteSeq(lootGuid[2]);
+    data.WriteByteSeq(lootGuid[0]);
+    data.WriteByteSeq(guid[3]);
+    data.WriteByteSeq(guid[6]);
+    data.WriteByteSeq(lootGuid[6]);
+    data.WriteByteSeq(guid[4]);
+    data.WriteByteSeq(lootGuid[4]);
+    data.WriteByteSeq(guid[7]);
     SendDirectMessage(&data);
 }
 
@@ -9312,10 +9473,7 @@ void Player::SendLoot(uint64 guid, LootType loot_type)
     loot->loot_type = loot_type;
 
     WorldPacket data(SMSG_LOOT_RESPONSE, 8 + 1 + 50 + 1 + 1);           // we guess size
-    data << uint64(guid);
-    data << uint8(loot_type);
-    data << LootView(*loot, this, permission);
-
+    LootView(*loot, this, permission).WriteData(guid, loot_type, &data);
     SendDirectMessage(&data);
 
     // add 'this' player as one of the players that are looting 'loot'
@@ -9328,23 +9486,80 @@ void Player::SendLoot(uint64 guid, LootType loot_type)
 
 void Player::SendNotifyLootMoneyRemoved()
 {
-    WorldPacket data(SMSG_LOOT_CLEAR_MONEY, 0);
+    ObjectGuid guid = GetLootGUID();
+
+    WorldPacket data(SMSG_LOOT_CLEAR_MONEY, 9);
+    data.WriteBit(guid[6]);
+    data.WriteBit(guid[0]);
+    data.WriteBit(guid[4]);
+    data.WriteBit(guid[1]);
+    data.WriteBit(guid[3]);
+    data.WriteBit(guid[5]);
+    data.WriteBit(guid[2]);
+    data.WriteBit(guid[7]);
+
+    data.WriteByteSeq(guid[0]);
+    data.WriteByteSeq(guid[4]);
+    data.WriteByteSeq(guid[2]);
+    data.WriteByteSeq(guid[7]);
+    data.WriteByteSeq(guid[1]);
+    data.WriteByteSeq(guid[5]);
+    data.WriteByteSeq(guid[3]);
+    data.WriteByteSeq(guid[6]);
+
     GetSession()->SendPacket(&data);
 }
 
-void Player::SendNotifyLootItemRemoved(uint8 lootSlot)
+void Player::SendNotifyLootItemRemoved(uint8 lootSlot, ObjectGuid guid)
 {
-    WorldPacket data(SMSG_LOOT_REMOVED, 1);
+    ObjectGuid lootGuid = guid;
+    // Guid could also be itemID
+
+    WorldPacket data(SMSG_LOOT_REMOVED, 19);
+    data.WriteBit(guid[7]);
+    data.WriteBit(guid[0]);
+    data.WriteBit(guid[2]);
+    data.WriteBit(lootGuid[0]);
+    data.WriteBit(lootGuid[1]);
+    data.WriteBit(lootGuid[2]);
+    data.WriteBit(lootGuid[7]);
+    data.WriteBit(lootGuid[6]);
+    data.WriteBit(lootGuid[5]);
+    data.WriteBit(guid[1]);
+    data.WriteBit(guid[5]);
+    data.WriteBit(guid[6]);
+    data.WriteBit(lootGuid[3]);
+    data.WriteBit(lootGuid[4]);
+    data.WriteBit(guid[3]);
+    data.WriteBit(guid[4]);
+
+    data.WriteByteSeq(lootGuid[1]);
+    data.WriteByteSeq(guid[7]);
+    data.WriteByteSeq(lootGuid[7]);
+    data.WriteByteSeq(lootGuid[0]);
+    data.WriteByteSeq(guid[6]);
+    data.WriteByteSeq(guid[2]);
+    data.WriteByteSeq(lootGuid[5]);
+    data.WriteByteSeq(lootGuid[3]);
+    data.WriteByteSeq(lootGuid[2]);
+    data.WriteByteSeq(guid[0]);
+    data.WriteByteSeq(guid[5]);
+    data.WriteByteSeq(guid[1]);
     data << uint8(lootSlot);
+    data.WriteByteSeq(lootGuid[6]);
+    data.WriteByteSeq(guid[3]);
+    data.WriteByteSeq(guid[4]);
+    data.WriteByteSeq(lootGuid[4]);
+
     GetSession()->SendPacket(&data);
 }
 
 void Player::SendUpdateWorldState(uint32 Field, uint32 Value)
 {
-    WorldPacket data(SMSG_UPDATE_WORLD_STATE, 4+4+1);
-    data << Field;
-    data << Value;
-    data << uint8(0);
+    WorldPacket data(SMSG_UPDATE_WORLD_STATE, 4 + 4 + 1);
+    data.WriteBit(0);
+    data << uint32(Value);
+    data << uint32(Field);
     GetSession()->SendPacket(&data);
 }
 
@@ -9359,28 +9574,24 @@ void Player::SendInitWorldStates(uint32 zoneid, uint32 areaid)
 
     TC_LOG_DEBUG("network", "Sending SMSG_INIT_WORLD_STATES to Map: %u, Zone: %u", mapid, zoneid);
 
-    WorldPacket data(SMSG_INIT_WORLD_STATES, (4+4+4+2+(12*8)));
-    data << uint32(mapid);                                  // mapid
-    data << uint32(zoneid);                                 // zone id
-    data << uint32(areaid);                                 // area id, new 2.1.0
-    size_t countPos = data.wpos();
-    data << uint16(0);                                      // count of uint64 blocks
-    data << uint32(0x8d8) << uint32(0x0);                   // 1
-    data << uint32(0x8d7) << uint32(0x0);                   // 2
-    data << uint32(0x8d6) << uint32(0x0);                   // 3
-    data << uint32(0x8d5) << uint32(0x0);                   // 4
-    data << uint32(0x8d4) << uint32(0x0);                   // 5
-    data << uint32(0x8d3) << uint32(0x0);                   // 6
+    WorldStateBuilder builder(mapid, areaid, zoneid);
+
+    builder.AppendState(0x8d8, 0x0);                   // 1
+    builder.AppendState(0x8d7, 0x0);                   // 2
+    builder.AppendState(0x8d6, 0x0);                   // 3
+    builder.AppendState(0x8d5, 0x0);                   // 4
+    builder.AppendState(0x8d4, 0x0);                   // 5
+    builder.AppendState(0x8d3, 0x0);                   // 6
                                                             // 7 1 - Arena season in progress, 0 - end of season
-    data << uint32(0xC77) << uint32(sWorld->getBoolConfig(CONFIG_ARENA_SEASON_IN_PROGRESS));
+    //builder.AppendState(0xC77, sWorld->getBoolConfig(CONFIG_ARENA_SEASON_IN_PROGRESS));
                                                             // 8 Arena season id
-    data << uint32(0xF3D) << uint32(sWorld->getIntConfig(CONFIG_ARENA_SEASON_ID));
+    //builder.AppendState(0xF3D, sWorld->getIntConfig(CONFIG_ARENA_SEASON_ID));
 
     if (mapid == 530)                                       // Outland
     {
-        data << uint32(0x9bf) << uint32(0x0);               // 7
-        data << uint32(0x9bd) << uint32(0xF);               // 8
-        data << uint32(0x9bb) << uint32(0xF);               // 9
+        builder.AppendState(0x9bf, 0x0);               // 7
+        builder.AppendState(0x9bd, 0xF);               // 8
+        builder.AppendState(0x9bb, 0xF);               // 9
     }
 
     // insert <field> <value>
@@ -9399,193 +9610,193 @@ void Player::SendInitWorldStates(uint32 zoneid, uint32 areaid)
             break;
         case 1377:                                          // Silithus
             if (pvp && pvp->GetTypeId() == OUTDOOR_PVP_SI)
-                pvp->FillInitialWorldStates(data);
+                pvp->FillInitialWorldStates(builder);
             else
             {
                 // states are always shown
-                data << uint32(2313) << uint32(0x0); // 7 ally silityst gathered
-                data << uint32(2314) << uint32(0x0); // 8 horde silityst gathered
-                data << uint32(2317) << uint32(0x0); // 9 max silithyst
+                builder.AppendState(2313, 0x0); // 7 ally silityst gathered
+                builder.AppendState(2314, 0x0); // 8 horde silityst gathered
+                builder.AppendState(2317, 0x0); // 9 max silithyst
             }
             // dunno about these... aq opening event maybe?
-            data << uint32(2322) << uint32(0x0); // 10 sandworm N
-            data << uint32(2323) << uint32(0x0); // 11 sandworm S
-            data << uint32(2324) << uint32(0x0); // 12 sandworm SW
-            data << uint32(2325) << uint32(0x0); // 13 sandworm E
+            builder.AppendState(2322, 0x0); // 10 sandworm N
+            builder.AppendState(2323, 0x0); // 11 sandworm S
+            builder.AppendState(2324, 0x0); // 12 sandworm SW
+            builder.AppendState(2325, 0x0); // 13 sandworm E
             break;
         case 2597:                                          // Alterac Valley
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_AV)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0x7ae) << uint32(0x1);           // 7 snowfall n
-                data << uint32(0x532) << uint32(0x1);           // 8 frostwolfhut hc
-                data << uint32(0x531) << uint32(0x0);           // 9 frostwolfhut ac
-                data << uint32(0x52e) << uint32(0x0);           // 10 stormpike firstaid a_a
-                data << uint32(0x571) << uint32(0x0);           // 11 east frostwolf tower horde assaulted -unused
-                data << uint32(0x570) << uint32(0x0);           // 12 west frostwolf tower horde assaulted - unused
-                data << uint32(0x567) << uint32(0x1);           // 13 frostwolfe c
-                data << uint32(0x566) << uint32(0x1);           // 14 frostwolfw c
-                data << uint32(0x550) << uint32(0x1);           // 15 irondeep (N) ally
-                data << uint32(0x544) << uint32(0x0);           // 16 ice grave a_a
-                data << uint32(0x536) << uint32(0x0);           // 17 stormpike grave h_c
-                data << uint32(0x535) << uint32(0x1);           // 18 stormpike grave a_c
-                data << uint32(0x518) << uint32(0x0);           // 19 stoneheart grave a_a
-                data << uint32(0x517) << uint32(0x0);           // 20 stoneheart grave h_a
-                data << uint32(0x574) << uint32(0x0);           // 21 1396 unk
-                data << uint32(0x573) << uint32(0x0);           // 22 iceblood tower horde assaulted -unused
-                data << uint32(0x572) << uint32(0x0);           // 23 towerpoint horde assaulted - unused
-                data << uint32(0x56f) << uint32(0x0);           // 24 1391 unk
-                data << uint32(0x56e) << uint32(0x0);           // 25 iceblood a
-                data << uint32(0x56d) << uint32(0x0);           // 26 towerp a
-                data << uint32(0x56c) << uint32(0x0);           // 27 frostwolfe a
-                data << uint32(0x56b) << uint32(0x0);           // 28 froswolfw a
-                data << uint32(0x56a) << uint32(0x1);           // 29 1386 unk
-                data << uint32(0x569) << uint32(0x1);           // 30 iceblood c
-                data << uint32(0x568) << uint32(0x1);           // 31 towerp c
-                data << uint32(0x565) << uint32(0x0);           // 32 stoneh tower a
-                data << uint32(0x564) << uint32(0x0);           // 33 icewing tower a
-                data << uint32(0x563) << uint32(0x0);           // 34 dunn a
-                data << uint32(0x562) << uint32(0x0);           // 35 duns a
-                data << uint32(0x561) << uint32(0x0);           // 36 stoneheart bunker alliance assaulted - unused
-                data << uint32(0x560) << uint32(0x0);           // 37 icewing bunker alliance assaulted - unused
-                data << uint32(0x55f) << uint32(0x0);           // 38 dunbaldar south alliance assaulted - unused
-                data << uint32(0x55e) << uint32(0x0);           // 39 dunbaldar north alliance assaulted - unused
-                data << uint32(0x55d) << uint32(0x0);           // 40 stone tower d
-                data << uint32(0x3c6) << uint32(0x0);           // 41 966 unk
-                data << uint32(0x3c4) << uint32(0x0);           // 42 964 unk
-                data << uint32(0x3c2) << uint32(0x0);           // 43 962 unk
-                data << uint32(0x516) << uint32(0x1);           // 44 stoneheart grave a_c
-                data << uint32(0x515) << uint32(0x0);           // 45 stonheart grave h_c
-                data << uint32(0x3b6) << uint32(0x0);           // 46 950 unk
-                data << uint32(0x55c) << uint32(0x0);           // 47 icewing tower d
-                data << uint32(0x55b) << uint32(0x0);           // 48 dunn d
-                data << uint32(0x55a) << uint32(0x0);           // 49 duns d
-                data << uint32(0x559) << uint32(0x0);           // 50 1369 unk
-                data << uint32(0x558) << uint32(0x0);           // 51 iceblood d
-                data << uint32(0x557) << uint32(0x0);           // 52 towerp d
-                data << uint32(0x556) << uint32(0x0);           // 53 frostwolfe d
-                data << uint32(0x555) << uint32(0x0);           // 54 frostwolfw d
-                data << uint32(0x554) << uint32(0x1);           // 55 stoneh tower c
-                data << uint32(0x553) << uint32(0x1);           // 56 icewing tower c
-                data << uint32(0x552) << uint32(0x1);           // 57 dunn c
-                data << uint32(0x551) << uint32(0x1);           // 58 duns c
-                data << uint32(0x54f) << uint32(0x0);           // 59 irondeep (N) horde
-                data << uint32(0x54e) << uint32(0x0);           // 60 irondeep (N) ally
-                data << uint32(0x54d) << uint32(0x1);           // 61 mine (S) neutral
-                data << uint32(0x54c) << uint32(0x0);           // 62 mine (S) horde
-                data << uint32(0x54b) << uint32(0x0);           // 63 mine (S) ally
-                data << uint32(0x545) << uint32(0x0);           // 64 iceblood h_a
-                data << uint32(0x543) << uint32(0x1);           // 65 iceblod h_c
-                data << uint32(0x542) << uint32(0x0);           // 66 iceblood a_c
-                data << uint32(0x540) << uint32(0x0);           // 67 snowfall h_a
-                data << uint32(0x53f) << uint32(0x0);           // 68 snowfall a_a
-                data << uint32(0x53e) << uint32(0x0);           // 69 snowfall h_c
-                data << uint32(0x53d) << uint32(0x0);           // 70 snowfall a_c
-                data << uint32(0x53c) << uint32(0x0);           // 71 frostwolf g h_a
-                data << uint32(0x53b) << uint32(0x0);           // 72 frostwolf g a_a
-                data << uint32(0x53a) << uint32(0x1);           // 73 frostwolf g h_c
-                data << uint32(0x539) << uint32(0x0);           // 74 frostwolf g a_c
-                data << uint32(0x538) << uint32(0x0);           // 75 stormpike grave h_a
-                data << uint32(0x537) << uint32(0x0);           // 76 stormpike grave a_a
-                data << uint32(0x534) << uint32(0x0);           // 77 frostwolf hut h_a
-                data << uint32(0x533) << uint32(0x0);           // 78 frostwolf hut a_a
-                data << uint32(0x530) << uint32(0x0);           // 79 stormpike first aid h_a
-                data << uint32(0x52f) << uint32(0x0);           // 80 stormpike first aid h_c
-                data << uint32(0x52d) << uint32(0x1);           // 81 stormpike first aid a_c
+                builder.AppendState(0x7ae, 0x1);           // 7 snowfall n
+                builder.AppendState(0x532, 0x1);           // 8 frostwolfhut hc
+                builder.AppendState(0x531, 0x0);           // 9 frostwolfhut ac
+                builder.AppendState(0x52e, 0x0);           // 10 stormpike firstaid a_a
+                builder.AppendState(0x571, 0x0);           // 11 east frostwolf tower horde assaulted -unused
+                builder.AppendState(0x570, 0x0);           // 12 west frostwolf tower horde assaulted - unused
+                builder.AppendState(0x567, 0x1);           // 13 frostwolfe c
+                builder.AppendState(0x566, 0x1);           // 14 frostwolfw c
+                builder.AppendState(0x550, 0x1);           // 15 irondeep (N) ally
+                builder.AppendState(0x544, 0x0);           // 16 ice grave a_a
+                builder.AppendState(0x536, 0x0);           // 17 stormpike grave h_c
+                builder.AppendState(0x535, 0x1);           // 18 stormpike grave a_c
+                builder.AppendState(0x518, 0x0);           // 19 stoneheart grave a_a
+                builder.AppendState(0x517, 0x0);           // 20 stoneheart grave h_a
+                builder.AppendState(0x574, 0x0);           // 21 1396 unk
+                builder.AppendState(0x573, 0x0);           // 22 iceblood tower horde assaulted -unused
+                builder.AppendState(0x572, 0x0);           // 23 towerpoint horde assaulted - unused
+                builder.AppendState(0x56f, 0x0);           // 24 1391 unk
+                builder.AppendState(0x56e, 0x0);           // 25 iceblood a
+                builder.AppendState(0x56d, 0x0);           // 26 towerp a
+                builder.AppendState(0x56c, 0x0);           // 27 frostwolfe a
+                builder.AppendState(0x56b, 0x0);           // 28 froswolfw a
+                builder.AppendState(0x56a, 0x1);           // 29 1386 unk
+                builder.AppendState(0x569, 0x1);           // 30 iceblood c
+                builder.AppendState(0x568, 0x1);           // 31 towerp c
+                builder.AppendState(0x565, 0x0);           // 32 stoneh tower a
+                builder.AppendState(0x564, 0x0);           // 33 icewing tower a
+                builder.AppendState(0x563, 0x0);           // 34 dunn a
+                builder.AppendState(0x562, 0x0);           // 35 duns a
+                builder.AppendState(0x561, 0x0);           // 36 stoneheart bunker alliance assaulted - unused
+                builder.AppendState(0x560, 0x0);           // 37 icewing bunker alliance assaulted - unused
+                builder.AppendState(0x55f, 0x0);           // 38 dunbaldar south alliance assaulted - unused
+                builder.AppendState(0x55e, 0x0);           // 39 dunbaldar north alliance assaulted - unused
+                builder.AppendState(0x55d, 0x0);           // 40 stone tower d
+                builder.AppendState(0x3c6, 0x0);           // 41 966 unk
+                builder.AppendState(0x3c4, 0x0);           // 42 964 unk
+                builder.AppendState(0x3c2, 0x0);           // 43 962 unk
+                builder.AppendState(0x516, 0x1);           // 44 stoneheart grave a_c
+                builder.AppendState(0x515, 0x0);           // 45 stonheart grave h_c
+                builder.AppendState(0x3b6, 0x0);           // 46 950 unk
+                builder.AppendState(0x55c, 0x0);           // 47 icewing tower d
+                builder.AppendState(0x55b, 0x0);           // 48 dunn d
+                builder.AppendState(0x55a, 0x0);           // 49 duns d
+                builder.AppendState(0x559, 0x0);           // 50 1369 unk
+                builder.AppendState(0x558, 0x0);           // 51 iceblood d
+                builder.AppendState(0x557, 0x0);           // 52 towerp d
+                builder.AppendState(0x556, 0x0);           // 53 frostwolfe d
+                builder.AppendState(0x555, 0x0);           // 54 frostwolfw d
+                builder.AppendState(0x554, 0x1);           // 55 stoneh tower c
+                builder.AppendState(0x553, 0x1);           // 56 icewing tower c
+                builder.AppendState(0x552, 0x1);           // 57 dunn c
+                builder.AppendState(0x551, 0x1);           // 58 duns c
+                builder.AppendState(0x54f, 0x0);           // 59 irondeep (N) horde
+                builder.AppendState(0x54e, 0x0);           // 60 irondeep (N) ally
+                builder.AppendState(0x54d, 0x1);           // 61 mine (S) neutral
+                builder.AppendState(0x54c, 0x0);           // 62 mine (S) horde
+                builder.AppendState(0x54b, 0x0);           // 63 mine (S) ally
+                builder.AppendState(0x545, 0x0);           // 64 iceblood h_a
+                builder.AppendState(0x543, 0x1);           // 65 iceblod h_c
+                builder.AppendState(0x542, 0x0);           // 66 iceblood a_c
+                builder.AppendState(0x540, 0x0);           // 67 snowfall h_a
+                builder.AppendState(0x53f, 0x0);           // 68 snowfall a_a
+                builder.AppendState(0x53e, 0x0);           // 69 snowfall h_c
+                builder.AppendState(0x53d, 0x0);           // 70 snowfall a_c
+                builder.AppendState(0x53c, 0x0);           // 71 frostwolf g h_a
+                builder.AppendState(0x53b, 0x0);           // 72 frostwolf g a_a
+                builder.AppendState(0x53a, 0x1);           // 73 frostwolf g h_c
+                builder.AppendState(0x539, 0x0);           // 74 frostwolf g a_c
+                builder.AppendState(0x538, 0x0);           // 75 stormpike grave h_a
+                builder.AppendState(0x537, 0x0);           // 76 stormpike grave a_a
+                builder.AppendState(0x534, 0x0);           // 77 frostwolf hut h_a
+                builder.AppendState(0x533, 0x0);           // 78 frostwolf hut a_a
+                builder.AppendState(0x530, 0x0);           // 79 stormpike first aid h_a
+                builder.AppendState(0x52f, 0x0);           // 80 stormpike first aid h_c
+                builder.AppendState(0x52d, 0x1);           // 81 stormpike first aid a_c
             }
             break;
         case 3277:                                          // Warsong Gulch
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_WS)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0x62d) << uint32(0x0);       // 7 1581 alliance flag captures
-                data << uint32(0x62e) << uint32(0x0);       // 8 1582 horde flag captures
-                data << uint32(0x609) << uint32(0x0);       // 9 1545 unk, set to 1 on alliance flag pickup...
-                data << uint32(0x60a) << uint32(0x0);       // 10 1546 unk, set to 1 on horde flag pickup, after drop it's -1
-                data << uint32(0x60b) << uint32(0x2);       // 11 1547 unk
-                data << uint32(0x641) << uint32(0x3);       // 12 1601 unk (max flag captures?)
-                data << uint32(0x922) << uint32(0x1);       // 13 2338 horde (0 - hide, 1 - flag ok, 2 - flag picked up (flashing), 3 - flag picked up (not flashing)
-                data << uint32(0x923) << uint32(0x1);       // 14 2339 alliance (0 - hide, 1 - flag ok, 2 - flag picked up (flashing), 3 - flag picked up (not flashing)
+                builder.AppendState(0x62d, 0x0);       // 7 1581 alliance flag captures
+                builder.AppendState(0x62e, 0x0);       // 8 1582 horde flag captures
+                builder.AppendState(0x609, 0x0);       // 9 1545 unk, set to 1 on alliance flag pickup...
+                builder.AppendState(0x60a, 0x0);       // 10 1546 unk, set to 1 on horde flag pickup, after drop it's -1
+                builder.AppendState(0x60b, 0x2);       // 11 1547 unk
+                builder.AppendState(0x641, 0x3);       // 12 1601 unk (max flag captures?)
+                builder.AppendState(0x922, 0x1);       // 13 2338 horde (0 - hide, 1 - flag ok, 2 - flag picked up (flashing), 3 - flag picked up (not flashing)
+                builder.AppendState(0x923, 0x1);       // 14 2339 alliance (0 - hide, 1 - flag ok, 2 - flag picked up (flashing), 3 - flag picked up (not flashing)
             }
             break;
         case 3358:                                          // Arathi Basin
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_AB)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0x6e7) << uint32(0x0);       // 7 1767 stables alliance
-                data << uint32(0x6e8) << uint32(0x0);       // 8 1768 stables horde
-                data << uint32(0x6e9) << uint32(0x0);       // 9 1769 unk, ST?
-                data << uint32(0x6ea) << uint32(0x0);       // 10 1770 stables (show/hide)
-                data << uint32(0x6ec) << uint32(0x0);       // 11 1772 farm (0 - horde controlled, 1 - alliance controlled)
-                data << uint32(0x6ed) << uint32(0x0);       // 12 1773 farm (show/hide)
-                data << uint32(0x6ee) << uint32(0x0);       // 13 1774 farm color
-                data << uint32(0x6ef) << uint32(0x0);       // 14 1775 gold mine color, may be FM?
-                data << uint32(0x6f0) << uint32(0x0);       // 15 1776 alliance resources
-                data << uint32(0x6f1) << uint32(0x0);       // 16 1777 horde resources
-                data << uint32(0x6f2) << uint32(0x0);       // 17 1778 horde bases
-                data << uint32(0x6f3) << uint32(0x0);       // 18 1779 alliance bases
-                data << uint32(0x6f4) << uint32(0x7d0);     // 19 1780 max resources (2000)
-                data << uint32(0x6f6) << uint32(0x0);       // 20 1782 blacksmith color
-                data << uint32(0x6f7) << uint32(0x0);       // 21 1783 blacksmith (show/hide)
-                data << uint32(0x6f8) << uint32(0x0);       // 22 1784 unk, bs?
-                data << uint32(0x6f9) << uint32(0x0);       // 23 1785 unk, bs?
-                data << uint32(0x6fb) << uint32(0x0);       // 24 1787 gold mine (0 - horde contr, 1 - alliance contr)
-                data << uint32(0x6fc) << uint32(0x0);       // 25 1788 gold mine (0 - conflict, 1 - horde)
-                data << uint32(0x6fd) << uint32(0x0);       // 26 1789 gold mine (1 - show/0 - hide)
-                data << uint32(0x6fe) << uint32(0x0);       // 27 1790 gold mine color
-                data << uint32(0x700) << uint32(0x0);       // 28 1792 gold mine color, wtf?, may be LM?
-                data << uint32(0x701) << uint32(0x0);       // 29 1793 lumber mill color (0 - conflict, 1 - horde contr)
-                data << uint32(0x702) << uint32(0x0);       // 30 1794 lumber mill (show/hide)
-                data << uint32(0x703) << uint32(0x0);       // 31 1795 lumber mill color color
-                data << uint32(0x732) << uint32(0x1);       // 32 1842 stables (1 - uncontrolled)
-                data << uint32(0x733) << uint32(0x1);       // 33 1843 gold mine (1 - uncontrolled)
-                data << uint32(0x734) << uint32(0x1);       // 34 1844 lumber mill (1 - uncontrolled)
-                data << uint32(0x735) << uint32(0x1);       // 35 1845 farm (1 - uncontrolled)
-                data << uint32(0x736) << uint32(0x1);       // 36 1846 blacksmith (1 - uncontrolled)
-                data << uint32(0x745) << uint32(0x2);       // 37 1861 unk
-                data << uint32(0x7a3) << uint32(0x708);     // 38 1955 warning limit (1800)
+                builder.AppendState(0x6e7, 0x0);       // 7 1767 stables alliance
+                builder.AppendState(0x6e8, 0x0);       // 8 1768 stables horde
+                builder.AppendState(0x6e9, 0x0);       // 9 1769 unk, ST?
+                builder.AppendState(0x6ea, 0x0);       // 10 1770 stables (show/hide)
+                builder.AppendState(0x6ec, 0x0);       // 11 1772 farm (0 - horde controlled, 1 - alliance controlled)
+                builder.AppendState(0x6ed, 0x0);       // 12 1773 farm (show/hide)
+                builder.AppendState(0x6ee, 0x0);       // 13 1774 farm color
+                builder.AppendState(0x6ef, 0x0);       // 14 1775 gold mine color, may be FM?
+                builder.AppendState(0x6f0, 0x0);       // 15 1776 alliance resources
+                builder.AppendState(0x6f1, 0x0);       // 16 1777 horde resources
+                builder.AppendState(0x6f2, 0x0);       // 17 1778 horde bases
+                builder.AppendState(0x6f3, 0x0);       // 18 1779 alliance bases
+                builder.AppendState(0x6f4, 0x7d0);     // 19 1780 max resources (2000)
+                builder.AppendState(0x6f6, 0x0);       // 20 1782 blacksmith color
+                builder.AppendState(0x6f7, 0x0);       // 21 1783 blacksmith (show/hide)
+                builder.AppendState(0x6f8, 0x0);       // 22 1784 unk, bs?
+                builder.AppendState(0x6f9, 0x0);       // 23 1785 unk, bs?
+                builder.AppendState(0x6fb, 0x0);       // 24 1787 gold mine (0 - horde contr, 1 - alliance contr)
+                builder.AppendState(0x6fc, 0x0);       // 25 1788 gold mine (0 - conflict, 1 - horde)
+                builder.AppendState(0x6fd, 0x0);       // 26 1789 gold mine (1 - show/0 - hide)
+                builder.AppendState(0x6fe, 0x0);       // 27 1790 gold mine color
+                builder.AppendState(0x700, 0x0);       // 28 1792 gold mine color, wtf?, may be LM?
+                builder.AppendState(0x701, 0x0);       // 29 1793 lumber mill color (0 - conflict, 1 - horde contr)
+                builder.AppendState(0x702, 0x0);       // 30 1794 lumber mill (show/hide)
+                builder.AppendState(0x703, 0x0);       // 31 1795 lumber mill color color
+                builder.AppendState(0x732, 0x1);       // 32 1842 stables (1 - uncontrolled)
+                builder.AppendState(0x733, 0x1);       // 33 1843 gold mine (1 - uncontrolled)
+                builder.AppendState(0x734, 0x1);       // 34 1844 lumber mill (1 - uncontrolled)
+                builder.AppendState(0x735, 0x1);       // 35 1845 farm (1 - uncontrolled)
+                builder.AppendState(0x736, 0x1);       // 36 1846 blacksmith (1 - uncontrolled)
+                builder.AppendState(0x745, 0x2);       // 37 1861 unk
+                builder.AppendState(0x7a3, 0x708);     // 38 1955 warning limit (1800)
             }
             break;
         case 3820:                                          // Eye of the Storm
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_EY)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0xac1) << uint32(0x0);       // 7  2753 Horde Bases
-                data << uint32(0xac0) << uint32(0x0);       // 8  2752 Alliance Bases
-                data << uint32(0xab6) << uint32(0x0);       // 9  2742 Mage Tower - Horde conflict
-                data << uint32(0xab5) << uint32(0x0);       // 10 2741 Mage Tower - Alliance conflict
-                data << uint32(0xab4) << uint32(0x0);       // 11 2740 Fel Reaver - Horde conflict
-                data << uint32(0xab3) << uint32(0x0);       // 12 2739 Fel Reaver - Alliance conflict
-                data << uint32(0xab2) << uint32(0x0);       // 13 2738 Draenei - Alliance conflict
-                data << uint32(0xab1) << uint32(0x0);       // 14 2737 Draenei - Horde conflict
-                data << uint32(0xab0) << uint32(0x0);       // 15 2736 unk // 0 at start
-                data << uint32(0xaaf) << uint32(0x0);       // 16 2735 unk // 0 at start
-                data << uint32(0xaad) << uint32(0x0);       // 17 2733 Draenei - Horde control
-                data << uint32(0xaac) << uint32(0x0);       // 18 2732 Draenei - Alliance control
-                data << uint32(0xaab) << uint32(0x1);       // 19 2731 Draenei uncontrolled (1 - yes, 0 - no)
-                data << uint32(0xaaa) << uint32(0x0);       // 20 2730 Mage Tower - Alliance control
-                data << uint32(0xaa9) << uint32(0x0);       // 21 2729 Mage Tower - Horde control
-                data << uint32(0xaa8) << uint32(0x1);       // 22 2728 Mage Tower uncontrolled (1 - yes, 0 - no)
-                data << uint32(0xaa7) << uint32(0x0);       // 23 2727 Fel Reaver - Horde control
-                data << uint32(0xaa6) << uint32(0x0);       // 24 2726 Fel Reaver - Alliance control
-                data << uint32(0xaa5) << uint32(0x1);       // 25 2725 Fel Reaver uncontrolled (1 - yes, 0 - no)
-                data << uint32(0xaa4) << uint32(0x0);       // 26 2724 Boold Elf - Horde control
-                data << uint32(0xaa3) << uint32(0x0);       // 27 2723 Boold Elf - Alliance control
-                data << uint32(0xaa2) << uint32(0x1);       // 28 2722 Boold Elf uncontrolled (1 - yes, 0 - no)
-                data << uint32(0xac5) << uint32(0x1);       // 29 2757 Flag (1 - show, 0 - hide) - doesn't work exactly this way!
-                data << uint32(0xad2) << uint32(0x1);       // 30 2770 Horde top-stats (1 - show, 0 - hide) // 02 -> horde picked up the flag
-                data << uint32(0xad1) << uint32(0x1);       // 31 2769 Alliance top-stats (1 - show, 0 - hide) // 02 -> alliance picked up the flag
-                data << uint32(0xabe) << uint32(0x0);       // 32 2750 Horde resources
-                data << uint32(0xabd) << uint32(0x0);       // 33 2749 Alliance resources
-                data << uint32(0xa05) << uint32(0x8e);      // 34 2565 unk, constant?
-                data << uint32(0xaa0) << uint32(0x0);       // 35 2720 Capturing progress-bar (100 -> empty (only grey), 0 -> blue|red (no grey), default 0)
-                data << uint32(0xa9f) << uint32(0x0);       // 36 2719 Capturing progress-bar (0 - left, 100 - right)
-                data << uint32(0xa9e) << uint32(0x0);       // 37 2718 Capturing progress-bar (1 - show, 0 - hide)
-                data << uint32(0xc0d) << uint32(0x17b);     // 38 3085 unk
+                builder.AppendState(0xac1, 0x0);       // 7  2753 Horde Bases
+                builder.AppendState(0xac0, 0x0);       // 8  2752 Alliance Bases
+                builder.AppendState(0xab6, 0x0);       // 9  2742 Mage Tower - Horde conflict
+                builder.AppendState(0xab5, 0x0);       // 10 2741 Mage Tower - Alliance conflict
+                builder.AppendState(0xab4, 0x0);       // 11 2740 Fel Reaver - Horde conflict
+                builder.AppendState(0xab3, 0x0);       // 12 2739 Fel Reaver - Alliance conflict
+                builder.AppendState(0xab2, 0x0);       // 13 2738 Draenei - Alliance conflict
+                builder.AppendState(0xab1, 0x0);       // 14 2737 Draenei - Horde conflict
+                builder.AppendState(0xab0, 0x0);       // 15 2736 unk // 0 at start
+                builder.AppendState(0xaaf, 0x0);       // 16 2735 unk // 0 at start
+                builder.AppendState(0xaad, 0x0);       // 17 2733 Draenei - Horde control
+                builder.AppendState(0xaac, 0x0);       // 18 2732 Draenei - Alliance control
+                builder.AppendState(0xaab, 0x1);       // 19 2731 Draenei uncontrolled (1 - yes, 0 - no)
+                builder.AppendState(0xaaa, 0x0);       // 20 2730 Mage Tower - Alliance control
+                builder.AppendState(0xaa9, 0x0);       // 21 2729 Mage Tower - Horde control
+                builder.AppendState(0xaa8, 0x1);       // 22 2728 Mage Tower uncontrolled (1 - yes, 0 - no)
+                builder.AppendState(0xaa7, 0x0);       // 23 2727 Fel Reaver - Horde control
+                builder.AppendState(0xaa6, 0x0);       // 24 2726 Fel Reaver - Alliance control
+                builder.AppendState(0xaa5, 0x1);       // 25 2725 Fel Reaver uncontrolled (1 - yes, 0 - no)
+                builder.AppendState(0xaa4, 0x0);       // 26 2724 Boold Elf - Horde control
+                builder.AppendState(0xaa3, 0x0);       // 27 2723 Boold Elf - Alliance control
+                builder.AppendState(0xaa2, 0x1);       // 28 2722 Boold Elf uncontrolled (1 - yes, 0 - no)
+                builder.AppendState(0xac5, 0x1);       // 29 2757 Flag (1 - show, 0 - hide) - doesn't work exactly this way!
+                builder.AppendState(0xad2, 0x1);       // 30 2770 Horde top-stats (1 - show, 0 - hide) // 02 -> horde picked up the flag
+                builder.AppendState(0xad1, 0x1);       // 31 2769 Alliance top-stats (1 - show, 0 - hide) // 02 -> alliance picked up the flag
+                builder.AppendState(0xabe, 0x0);       // 32 2750 Horde resources
+                builder.AppendState(0xabd, 0x0);       // 33 2749 Alliance resources
+                builder.AppendState(0xa05, 0x8e);      // 34 2565 unk, constant?
+                builder.AppendState(0xaa0, 0x0);       // 35 2720 Capturing progress-bar (100 -> empty (only grey), 0 -> blue|red (no grey), default 0)
+                builder.AppendState(0xa9f, 0x0);       // 36 2719 Capturing progress-bar (0 - left, 100 - right)
+                builder.AppendState(0xa9e, 0x0);       // 37 2718 Capturing progress-bar (1 - show, 0 - hide)
+                builder.AppendState(0xc0d, 0x17b);     // 38 3085 unk
                 // and some more ... unknown
             }
             break;
@@ -9593,354 +9804,352 @@ void Player::SendInitWorldStates(uint32 zoneid, uint32 areaid)
         // ON EVERY ZONE LEAVE, RESET THE OLD ZONE'S WORLD STATE, BUT AT LEAST THE UI STUFF!
         case 3483:                                          // Hellfire Peninsula
             if (pvp && pvp->GetTypeId() == OUTDOOR_PVP_HP)
-                pvp->FillInitialWorldStates(data);
+                pvp->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0x9ba) << uint32(0x1);           // 10 // add ally tower main gui icon       // maybe should be sent only on login?
-                data << uint32(0x9b9) << uint32(0x1);           // 11 // add horde tower main gui icon      // maybe should be sent only on login?
-                data << uint32(0x9b5) << uint32(0x0);           // 12 // show neutral broken hill icon      // 2485
-                data << uint32(0x9b4) << uint32(0x1);           // 13 // show icon above broken hill        // 2484
-                data << uint32(0x9b3) << uint32(0x0);           // 14 // show ally broken hill icon         // 2483
-                data << uint32(0x9b2) << uint32(0x0);           // 15 // show neutral overlook icon         // 2482
-                data << uint32(0x9b1) << uint32(0x1);           // 16 // show the overlook arrow            // 2481
-                data << uint32(0x9b0) << uint32(0x0);           // 17 // show ally overlook icon            // 2480
-                data << uint32(0x9ae) << uint32(0x0);           // 18 // horde pvp objectives captured      // 2478
-                data << uint32(0x9ac) << uint32(0x0);           // 19 // ally pvp objectives captured       // 2476
-                data << uint32(2475)  << uint32(100); //: ally / horde slider grey area                              // show only in direct vicinity!
-                data << uint32(2474)  << uint32(50);  //: ally / horde slider percentage, 100 for ally, 0 for horde  // show only in direct vicinity!
-                data << uint32(2473)  << uint32(0);   //: ally / horde slider display                                // show only in direct vicinity!
-                data << uint32(0x9a8) << uint32(0x0);           // 20 // show the neutral stadium icon      // 2472
-                data << uint32(0x9a7) << uint32(0x0);           // 21 // show the ally stadium icon         // 2471
-                data << uint32(0x9a6) << uint32(0x1);           // 22 // show the horde stadium icon        // 2470
+                builder.AppendState(0x9ba, 0x1);           // 10 // add ally tower main gui icon       // maybe should be sent only on login?
+                builder.AppendState(0x9b9, 0x1);           // 11 // add horde tower main gui icon      // maybe should be sent only on login?
+                builder.AppendState(0x9b5, 0x0);           // 12 // show neutral broken hill icon      // 2485
+                builder.AppendState(0x9b4, 0x1);           // 13 // show icon above broken hill        // 2484
+                builder.AppendState(0x9b3, 0x0);           // 14 // show ally broken hill icon         // 2483
+                builder.AppendState(0x9b2, 0x0);           // 15 // show neutral overlook icon         // 2482
+                builder.AppendState(0x9b1, 0x1);           // 16 // show the overlook arrow            // 2481
+                builder.AppendState(0x9b0, 0x0);           // 17 // show ally overlook icon            // 2480
+                builder.AppendState(0x9ae, 0x0);           // 18 // horde pvp objectives captured      // 2478
+                builder.AppendState(0x9ac, 0x0);           // 19 // ally pvp objectives captured       // 2476
+                builder.AppendState(2475,  100);           //: ally / horde slider grey area                              // show only in direct vicinity!
+                builder.AppendState(2474,  50);            //: ally / horde slider percentage, 100 for ally, 0 for horde  // show only in direct vicinity!
+                builder.AppendState(2473,  0);             //: ally / horde slider display                                // show only in direct vicinity!
+                builder.AppendState(0x9a8, 0x0);           // 20 // show the neutral stadium icon      // 2472
+                builder.AppendState(0x9a7, 0x0);           // 21 // show the ally stadium icon         // 2471
+                builder.AppendState(0x9a6, 0x1);           // 22 // show the horde stadium icon        // 2470
             }
             break;
         case 3518:                                          // Nagrand
             if (pvp && pvp->GetTypeId() == OUTDOOR_PVP_NA)
-                pvp->FillInitialWorldStates(data);
+                pvp->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(2503) << uint32(0x0);    // 10
-                data << uint32(2502) << uint32(0x0);    // 11
-                data << uint32(2493) << uint32(0x0);    // 12
-                data << uint32(2491) << uint32(0x0);    // 13
+                builder.AppendState(2503, 0x0);    // 10
+                builder.AppendState(2502, 0x0);    // 11
+                builder.AppendState(2493, 0x0);    // 12
+                builder.AppendState(2491, 0x0);    // 13
 
-                data << uint32(2495) << uint32(0x0);    // 14
-                data << uint32(2494) << uint32(0x0);    // 15
-                data << uint32(2497) << uint32(0x0);    // 16
+                builder.AppendState(2495, 0x0);    // 14
+                builder.AppendState(2494, 0x0);    // 15
+                builder.AppendState(2497, 0x0);    // 16
 
-                data << uint32(2762) << uint32(0x0);    // 17
-                data << uint32(2662) << uint32(0x0);    // 18
-                data << uint32(2663) << uint32(0x0);    // 19
-                data << uint32(2664) << uint32(0x0);    // 20
+                builder.AppendState(2762, 0x0);    // 17
+                builder.AppendState(2662, 0x0);    // 18
+                builder.AppendState(2663, 0x0);    // 19
+                builder.AppendState(2664, 0x0);    // 20
 
-                data << uint32(2760) << uint32(0x0);    // 21
-                data << uint32(2670) << uint32(0x0);    // 22
-                data << uint32(2668) << uint32(0x0);    // 23
-                data << uint32(2669) << uint32(0x0);    // 24
+                builder.AppendState(2760, 0x0);    // 21
+                builder.AppendState(2670, 0x0);    // 22
+                builder.AppendState(2668, 0x0);    // 23
+                builder.AppendState(2669, 0x0);    // 24
 
-                data << uint32(2761) << uint32(0x0);    // 25
-                data << uint32(2667) << uint32(0x0);    // 26
-                data << uint32(2665) << uint32(0x0);    // 27
-                data << uint32(2666) << uint32(0x0);    // 28
+                builder.AppendState(2761, 0x0);    // 25
+                builder.AppendState(2667, 0x0);    // 26
+                builder.AppendState(2665, 0x0);    // 27
+                builder.AppendState(2666, 0x0);    // 28
 
-                data << uint32(2763) << uint32(0x0);    // 29
-                data << uint32(2659) << uint32(0x0);    // 30
-                data << uint32(2660) << uint32(0x0);    // 31
-                data << uint32(2661) << uint32(0x0);    // 32
+                builder.AppendState(2763, 0x0);    // 29
+                builder.AppendState(2659, 0x0);    // 30
+                builder.AppendState(2660, 0x0);    // 31
+                builder.AppendState(2661, 0x0);    // 32
 
-                data << uint32(2671) << uint32(0x0);    // 33
-                data << uint32(2676) << uint32(0x0);    // 34
-                data << uint32(2677) << uint32(0x0);    // 35
-                data << uint32(2672) << uint32(0x0);    // 36
-                data << uint32(2673) << uint32(0x0);    // 37
+                builder.AppendState(2671, 0x0);    // 33
+                builder.AppendState(2676, 0x0);    // 34
+                builder.AppendState(2677, 0x0);    // 35
+                builder.AppendState(2672, 0x0);    // 36
+                builder.AppendState(2673, 0x0);    // 37
             }
             break;
         case 3519:                                          // Terokkar Forest
             if (pvp && pvp->GetTypeId() == OUTDOOR_PVP_TF)
-                pvp->FillInitialWorldStates(data);
+                pvp->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0xa41) << uint32(0x0);           // 10 // 2625 capture bar pos
-                data << uint32(0xa40) << uint32(0x14);          // 11 // 2624 capture bar neutral
-                data << uint32(0xa3f) << uint32(0x0);           // 12 // 2623 show capture bar
-                data << uint32(0xa3e) << uint32(0x0);           // 13 // 2622 horde towers controlled
-                data << uint32(0xa3d) << uint32(0x5);           // 14 // 2621 ally towers controlled
-                data << uint32(0xa3c) << uint32(0x0);           // 15 // 2620 show towers controlled
-                data << uint32(0xa88) << uint32(0x0);           // 16 // 2696 SE Neu
-                data << uint32(0xa87) << uint32(0x0);           // 17 // SE Horde
-                data << uint32(0xa86) << uint32(0x0);           // 18 // SE Ally
-                data << uint32(0xa85) << uint32(0x0);           // 19 //S Neu
-                data << uint32(0xa84) << uint32(0x0);           // 20 S Horde
-                data << uint32(0xa83) << uint32(0x0);           // 21 S Ally
-                data << uint32(0xa82) << uint32(0x0);           // 22 NE Neu
-                data << uint32(0xa81) << uint32(0x0);           // 23 NE Horde
-                data << uint32(0xa80) << uint32(0x0);           // 24 NE Ally
-                data << uint32(0xa7e) << uint32(0x0);           // 25 // 2686 N Neu
-                data << uint32(0xa7d) << uint32(0x0);           // 26 N Horde
-                data << uint32(0xa7c) << uint32(0x0);           // 27 N Ally
-                data << uint32(0xa7b) << uint32(0x0);           // 28 NW Ally
-                data << uint32(0xa7a) << uint32(0x0);           // 29 NW Horde
-                data << uint32(0xa79) << uint32(0x0);           // 30 NW Neutral
-                data << uint32(0x9d0) << uint32(0x5);           // 31 // 2512 locked time remaining seconds first digit
-                data << uint32(0x9ce) << uint32(0x0);           // 32 // 2510 locked time remaining seconds second digit
-                data << uint32(0x9cd) << uint32(0x0);           // 33 // 2509 locked time remaining minutes
-                data << uint32(0x9cc) << uint32(0x0);           // 34 // 2508 neutral locked time show
-                data << uint32(0xad0) << uint32(0x0);           // 35 // 2768 horde locked time show
-                data << uint32(0xacf) << uint32(0x1);           // 36 // 2767 ally locked time show
+                builder.AppendState(0xa41, 0x0);           // 10 // 2625 capture bar pos
+                builder.AppendState(0xa40, 0x14);          // 11 // 2624 capture bar neutral
+                builder.AppendState(0xa3f, 0x0);           // 12 // 2623 show capture bar
+                builder.AppendState(0xa3e, 0x0);           // 13 // 2622 horde towers controlled
+                builder.AppendState(0xa3d, 0x5);           // 14 // 2621 ally towers controlled
+                builder.AppendState(0xa3c, 0x0);           // 15 // 2620 show towers controlled
+                builder.AppendState(0xa88, 0x0);           // 16 // 2696 SE Neu
+                builder.AppendState(0xa87, 0x0);           // 17 // SE Horde
+                builder.AppendState(0xa86, 0x0);           // 18 // SE Ally
+                builder.AppendState(0xa85, 0x0);           // 19 //S Neu
+                builder.AppendState(0xa84, 0x0);           // 20 S Horde
+                builder.AppendState(0xa83, 0x0);           // 21 S Ally
+                builder.AppendState(0xa82, 0x0);           // 22 NE Neu
+                builder.AppendState(0xa81, 0x0);           // 23 NE Horde
+                builder.AppendState(0xa80, 0x0);           // 24 NE Ally
+                builder.AppendState(0xa7e, 0x0);           // 25 // 2686 N Neu
+                builder.AppendState(0xa7d, 0x0);           // 26 N Horde
+                builder.AppendState(0xa7c, 0x0);           // 27 N Ally
+                builder.AppendState(0xa7b, 0x0);           // 28 NW Ally
+                builder.AppendState(0xa7a, 0x0);           // 29 NW Horde
+                builder.AppendState(0xa79, 0x0);           // 30 NW Neutral
+                builder.AppendState(0x9d0, 0x5);           // 31 // 2512 locked time remaining seconds first digit
+                builder.AppendState(0x9ce, 0x0);           // 32 // 2510 locked time remaining seconds second digit
+                builder.AppendState(0x9cd, 0x0);           // 33 // 2509 locked time remaining minutes
+                builder.AppendState(0x9cc, 0x0);           // 34 // 2508 neutral locked time show
+                builder.AppendState(0xad0, 0x0);           // 35 // 2768 horde locked time show
+                builder.AppendState(0xacf, 0x1);           // 36 // 2767 ally locked time show
             }
             break;
         case 3521:                                          // Zangarmarsh
             if (pvp && pvp->GetTypeId() == OUTDOOR_PVP_ZM)
-                pvp->FillInitialWorldStates(data);
+                pvp->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0x9e1) << uint32(0x0);           // 10 //2529
-                data << uint32(0x9e0) << uint32(0x0);           // 11
-                data << uint32(0x9df) << uint32(0x0);           // 12
-                data << uint32(0xa5d) << uint32(0x1);           // 13 //2653
-                data << uint32(0xa5c) << uint32(0x0);           // 14 //2652 east beacon neutral
-                data << uint32(0xa5b) << uint32(0x1);           // 15 horde
-                data << uint32(0xa5a) << uint32(0x0);           // 16 ally
-                data << uint32(0xa59) << uint32(0x1);           // 17 // 2649 Twin spire graveyard horde  12???
-                data << uint32(0xa58) << uint32(0x0);           // 18 ally     14 ???
-                data << uint32(0xa57) << uint32(0x0);           // 19 neutral  7???
-                data << uint32(0xa56) << uint32(0x0);           // 20 // 2646 west beacon neutral
-                data << uint32(0xa55) << uint32(0x1);           // 21 horde
-                data << uint32(0xa54) << uint32(0x0);           // 22 ally
-                data << uint32(0x9e7) << uint32(0x0);           // 23 // 2535
-                data << uint32(0x9e6) << uint32(0x0);           // 24
-                data << uint32(0x9e5) << uint32(0x0);           // 25
-                data << uint32(0xa00) << uint32(0x0);           // 26 // 2560
-                data << uint32(0x9ff) << uint32(0x1);           // 27
-                data << uint32(0x9fe) << uint32(0x0);           // 28
-                data << uint32(0x9fd) << uint32(0x0);           // 29
-                data << uint32(0x9fc) << uint32(0x1);           // 30
-                data << uint32(0x9fb) << uint32(0x0);           // 31
-                data << uint32(0xa62) << uint32(0x0);           // 32 // 2658
-                data << uint32(0xa61) << uint32(0x1);           // 33
-                data << uint32(0xa60) << uint32(0x1);           // 34
-                data << uint32(0xa5f) << uint32(0x0);           // 35
+                builder.AppendState(0x9e1, 0x0);           // 10 //2529
+                builder.AppendState(0x9e0, 0x0);           // 11
+                builder.AppendState(0x9df, 0x0);           // 12
+                builder.AppendState(0xa5d, 0x1);           // 13 //2653
+                builder.AppendState(0xa5c, 0x0);           // 14 //2652 east beacon neutral
+                builder.AppendState(0xa5b, 0x1);           // 15 horde
+                builder.AppendState(0xa5a, 0x0);           // 16 ally
+                builder.AppendState(0xa59, 0x1);           // 17 // 2649 Twin spire graveyard horde  12???
+                builder.AppendState(0xa58, 0x0);           // 18 ally     14 ???
+                builder.AppendState(0xa57, 0x0);           // 19 neutral  7???
+                builder.AppendState(0xa56, 0x0);           // 20 // 2646 west beacon neutral
+                builder.AppendState(0xa55, 0x1);           // 21 horde
+                builder.AppendState(0xa54, 0x0);           // 22 ally
+                builder.AppendState(0x9e7, 0x0);           // 23 // 2535
+                builder.AppendState(0x9e6, 0x0);           // 24
+                builder.AppendState(0x9e5, 0x0);           // 25
+                builder.AppendState(0xa00, 0x0);           // 26 // 2560
+                builder.AppendState(0x9ff, 0x1);           // 27
+                builder.AppendState(0x9fe, 0x0);           // 28
+                builder.AppendState(0x9fd, 0x0);           // 29
+                builder.AppendState(0x9fc, 0x1);           // 30
+                builder.AppendState(0x9fb, 0x0);           // 31
+                builder.AppendState(0xa62, 0x0);           // 32 // 2658
+                builder.AppendState(0xa61, 0x1);           // 33
+                builder.AppendState(0xa60, 0x1);           // 34
+                builder.AppendState(0xa5f, 0x0);           // 35
             }
             break;
         case 3698:                                          // Nagrand Arena
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_NA)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0xa0f) << uint32(0x0);           // 7
-                data << uint32(0xa10) << uint32(0x0);           // 8
-                data << uint32(0xa11) << uint32(0x0);           // 9 show
+                builder.AppendState(0xa0f, 0x0);           // 7
+                builder.AppendState(0xa10, 0x0);           // 8
+                builder.AppendState(0xa11, 0x0);           // 9 show
             }
             break;
         case 3702:                                          // Blade's Edge Arena
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_BE)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0x9f0) << uint32(0x0);           // 7 gold
-                data << uint32(0x9f1) << uint32(0x0);           // 8 green
-                data << uint32(0x9f3) << uint32(0x0);           // 9 show
+                builder.AppendState(0x9f0, 0x0);           // 7 gold
+                builder.AppendState(0x9f1, 0x0);           // 8 green
+                builder.AppendState(0x9f3, 0x0);           // 9 show
             }
             break;
         case 3968:                                          // Ruins of Lordaeron
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_RL)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0xbb8) << uint32(0x0);           // 7 gold
-                data << uint32(0xbb9) << uint32(0x0);           // 8 green
-                data << uint32(0xbba) << uint32(0x0);           // 9 show
+                builder.AppendState(0xbb8, 0x0);           // 7 gold
+                builder.AppendState(0xbb9, 0x0);           // 8 green
+                builder.AppendState(0xbba, 0x0);           // 9 show
             }
             break;
         case 4378:                                          // Dalaran Sewers
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_DS)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(3601) << uint32(0x0);           // 7 gold
-                data << uint32(3600) << uint32(0x0);           // 8 green
-                data << uint32(3610) << uint32(0x0);           // 9 show
+                builder.AppendState(3601, 0x0);           // 7 gold
+                builder.AppendState(3600, 0x0);           // 8 green
+                builder.AppendState(3610, 0x0);           // 9 show
             }
             break;
         case 4384:                                          // Strand of the Ancients
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_SA)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
                 // 1-3 A defend, 4-6 H defend, 7-9 unk defend, 1 - ok, 2 - half destroyed, 3 - destroyed
-                data << uint32(0xf09) << uint32(0x0);       // 7  3849 Gate of Temple
-                data << uint32(0xe36) << uint32(0x0);       // 8  3638 Gate of Yellow Moon
-                data << uint32(0xe27) << uint32(0x0);       // 9  3623 Gate of Green Emerald
-                data << uint32(0xe24) << uint32(0x0);       // 10 3620 Gate of Blue Sapphire
-                data << uint32(0xe21) << uint32(0x0);       // 11 3617 Gate of Red Sun
-                data << uint32(0xe1e) << uint32(0x0);       // 12 3614 Gate of Purple Ametyst
+                builder.AppendState(0xf09, 0x0);       // 7  3849 Gate of Temple
+                builder.AppendState(0xe36, 0x0);       // 8  3638 Gate of Yellow Moon
+                builder.AppendState(0xe27, 0x0);       // 9  3623 Gate of Green Emerald
+                builder.AppendState(0xe24, 0x0);       // 10 3620 Gate of Blue Sapphire
+                builder.AppendState(0xe21, 0x0);       // 11 3617 Gate of Red Sun
+                builder.AppendState(0xe1e, 0x0);       // 12 3614 Gate of Purple Ametyst
 
-                data << uint32(0xdf3) << uint32(0x0);       // 13 3571 bonus timer (1 - on, 0 - off)
-                data << uint32(0xded) << uint32(0x0);       // 14 3565 Horde Attacker
-                data << uint32(0xdec) << uint32(0x0);       // 15 3564 Alliance Attacker
+                builder.AppendState(0xdf3, 0x0);       // 13 3571 bonus timer (1 - on, 0 - off)
+                builder.AppendState(0xded, 0x0);       // 14 3565 Horde Attacker
+                builder.AppendState(0xdec, 0x0);       // 15 3564 Alliance Attacker
                 // End Round (timer), better explain this by example, eg. ends in 19:59 -> A:BC
-                data << uint32(0xde9) << uint32(0x0);       // 16 3561 C
-                data << uint32(0xde8) << uint32(0x0);       // 17 3560 B
-                data << uint32(0xde7) << uint32(0x0);       // 18 3559 A
-                data << uint32(0xe35) << uint32(0x0);       // 19 3637 East g - Horde control
-                data << uint32(0xe34) << uint32(0x0);       // 20 3636 West g - Horde control
-                data << uint32(0xe33) << uint32(0x0);       // 21 3635 South g - Horde control
-                data << uint32(0xe32) << uint32(0x0);       // 22 3634 East g - Alliance control
-                data << uint32(0xe31) << uint32(0x0);       // 23 3633 West g - Alliance control
-                data << uint32(0xe30) << uint32(0x0);       // 24 3632 South g - Alliance control
-                data << uint32(0xe2f) << uint32(0x0);       // 25 3631 Chamber of Ancients - Horde control
-                data << uint32(0xe2e) << uint32(0x0);       // 26 3630 Chamber of Ancients - Alliance control
-                data << uint32(0xe2d) << uint32(0x0);       // 27 3629 Beach1 - Horde control
-                data << uint32(0xe2c) << uint32(0x0);       // 28 3628 Beach2 - Horde control
-                data << uint32(0xe2b) << uint32(0x0);       // 29 3627 Beach1 - Alliance control
-                data << uint32(0xe2a) << uint32(0x0);       // 30 3626 Beach2 - Alliance control
+                builder.AppendState(0xde9, 0x0);       // 16 3561 C
+                builder.AppendState(0xde8, 0x0);       // 17 3560 B
+                builder.AppendState(0xde7, 0x0);       // 18 3559 A
+                builder.AppendState(0xe35, 0x0);       // 19 3637 East g - Horde control
+                builder.AppendState(0xe34, 0x0);       // 20 3636 West g - Horde control
+                builder.AppendState(0xe33, 0x0);       // 21 3635 South g - Horde control
+                builder.AppendState(0xe32, 0x0);       // 22 3634 East g - Alliance control
+                builder.AppendState(0xe31, 0x0);       // 23 3633 West g - Alliance control
+                builder.AppendState(0xe30, 0x0);       // 24 3632 South g - Alliance control
+                builder.AppendState(0xe2f, 0x0);       // 25 3631 Chamber of Ancients - Horde control
+                builder.AppendState(0xe2e, 0x0);       // 26 3630 Chamber of Ancients - Alliance control
+                builder.AppendState(0xe2d, 0x0);       // 27 3629 Beach1 - Horde control
+                builder.AppendState(0xe2c, 0x0);       // 28 3628 Beach2 - Horde control
+                builder.AppendState(0xe2b, 0x0);       // 29 3627 Beach1 - Alliance control
+                builder.AppendState(0xe2a, 0x0);       // 30 3626 Beach2 - Alliance control
                 // and many unks...
             }
             break;
         case 4406:                                          // Ring of Valor
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_RV)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0xe10) << uint32(0x0);           // 7 gold
-                data << uint32(0xe11) << uint32(0x0);           // 8 green
-                data << uint32(0xe1a) << uint32(0x0);           // 9 show
+                builder.AppendState(0xe10, 0x0);           // 7 gold
+                builder.AppendState(0xe11, 0x0);           // 8 green
+                builder.AppendState(0xe1a, 0x0);           // 9 show
             }
             break;
         case 4710:
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_IC)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(4221) << uint32(1); // 7 BG_IC_ALLIANCE_RENFORT_SET
-                data << uint32(4222) << uint32(1); // 8 BG_IC_HORDE_RENFORT_SET
-                data << uint32(4226) << uint32(300); // 9 BG_IC_ALLIANCE_RENFORT
-                data << uint32(4227) << uint32(300); // 10 BG_IC_HORDE_RENFORT
-                data << uint32(4322) << uint32(1); // 11 BG_IC_GATE_FRONT_H_WS_OPEN
-                data << uint32(4321) << uint32(1); // 12 BG_IC_GATE_WEST_H_WS_OPEN
-                data << uint32(4320) << uint32(1); // 13 BG_IC_GATE_EAST_H_WS_OPEN
-                data << uint32(4323) << uint32(1); // 14 BG_IC_GATE_FRONT_A_WS_OPEN
-                data << uint32(4324) << uint32(1); // 15 BG_IC_GATE_WEST_A_WS_OPEN
-                data << uint32(4325) << uint32(1); // 16 BG_IC_GATE_EAST_A_WS_OPEN
-                data << uint32(4317) << uint32(1); // 17 unknown
+                builder.AppendState(4221, 1); // 7 BG_IC_ALLIANCE_RENFORT_SET
+                builder.AppendState(4222, 1); // 8 BG_IC_HORDE_RENFORT_SET
+                builder.AppendState(4226, 300); // 9 BG_IC_ALLIANCE_RENFORT
+                builder.AppendState(4227, 300); // 10 BG_IC_HORDE_RENFORT
+                builder.AppendState(4322, 1); // 11 BG_IC_GATE_FRONT_H_WS_OPEN
+                builder.AppendState(4321, 1); // 12 BG_IC_GATE_WEST_H_WS_OPEN
+                builder.AppendState(4320, 1); // 13 BG_IC_GATE_EAST_H_WS_OPEN
+                builder.AppendState(4323, 1); // 14 BG_IC_GATE_FRONT_A_WS_OPEN
+                builder.AppendState(4324, 1); // 15 BG_IC_GATE_WEST_A_WS_OPEN
+                builder.AppendState(4325, 1); // 16 BG_IC_GATE_EAST_A_WS_OPEN
+                builder.AppendState(4317, 1); // 17 unknown
 
-                data << uint32(4301) << uint32(1); // 18 BG_IC_DOCKS_UNCONTROLLED
-                data << uint32(4296) << uint32(1); // 19 BG_IC_HANGAR_UNCONTROLLED
-                data << uint32(4306) << uint32(1); // 20 BG_IC_QUARRY_UNCONTROLLED
-                data << uint32(4311) << uint32(1); // 21 BG_IC_REFINERY_UNCONTROLLED
-                data << uint32(4294) << uint32(1); // 22 BG_IC_WORKSHOP_UNCONTROLLED
-                data << uint32(4243) << uint32(1); // 23 unknown
-                data << uint32(4345) << uint32(1); // 24 unknown
+                builder.AppendState(4301, 1); // 18 BG_IC_DOCKS_UNCONTROLLED
+                builder.AppendState(4296, 1); // 19 BG_IC_HANGAR_UNCONTROLLED
+                builder.AppendState(4306, 1); // 20 BG_IC_QUARRY_UNCONTROLLED
+                builder.AppendState(4311, 1); // 21 BG_IC_REFINERY_UNCONTROLLED
+                builder.AppendState(4294, 1); // 22 BG_IC_WORKSHOP_UNCONTROLLED
+                builder.AppendState(4243, 1); // 23 unknown
+                builder.AppendState(4345, 1); // 24 unknown
             }
             break;
         // The Ruby Sanctum
         case 4987:
             if (instance && mapid == 724)
-                instance->FillInitialWorldStates(data);
+                instance->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(5049) << uint32(50);             // 9  WORLDSTATE_CORPOREALITY_MATERIAL
-                data << uint32(5050) << uint32(50);             // 10 WORLDSTATE_CORPOREALITY_TWILIGHT
-                data << uint32(5051) << uint32(0);              // 11 WORLDSTATE_CORPOREALITY_TOGGLE
+                builder.AppendState(5049, 50);             // 9  WORLDSTATE_CORPOREALITY_MATERIAL
+                builder.AppendState(5050, 50);             // 10 WORLDSTATE_CORPOREALITY_TWILIGHT
+                builder.AppendState(5051, 0);              // 11 WORLDSTATE_CORPOREALITY_TOGGLE
             }
             break;
         // Icecrown Citadel
         case 4812:
             if (instance && mapid == 631)
-                instance->FillInitialWorldStates(data);
+                instance->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(4903) << uint32(0);              // 9  WORLDSTATE_SHOW_TIMER (Blood Quickening weekly)
-                data << uint32(4904) << uint32(30);             // 10 WORLDSTATE_EXECUTION_TIME
-                data << uint32(4940) << uint32(0);              // 11 WORLDSTATE_SHOW_ATTEMPTS
-                data << uint32(4941) << uint32(50);             // 12 WORLDSTATE_ATTEMPTS_REMAINING
-                data << uint32(4942) << uint32(50);             // 13 WORLDSTATE_ATTEMPTS_MAX
+                builder.AppendState(4903, 0);              // 9  WORLDSTATE_SHOW_TIMER (Blood Quickening weekly)
+                builder.AppendState(4904, 30);             // 10 WORLDSTATE_EXECUTION_TIME
+                builder.AppendState(4940, 0);              // 11 WORLDSTATE_SHOW_ATTEMPTS
+                builder.AppendState(4941, 50);             // 12 WORLDSTATE_ATTEMPTS_REMAINING
+                builder.AppendState(4942, 50);             // 13 WORLDSTATE_ATTEMPTS_MAX
             }
             break;
         // The Culling of Stratholme
         case 4100:
             if (instance && mapid == 595)
-                instance->FillInitialWorldStates(data);
+                instance->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(3479) << uint32(0);              // 9  WORLDSTATE_SHOW_CRATES
-                data << uint32(3480) << uint32(0);              // 10 WORLDSTATE_CRATES_REVEALED
-                data << uint32(3504) << uint32(0);              // 11 WORLDSTATE_WAVE_COUNT
-                data << uint32(3931) << uint32(25);             // 12 WORLDSTATE_TIME_GUARDIAN
-                data << uint32(3932) << uint32(0);              // 13 WORLDSTATE_TIME_GUARDIAN_SHOW
+                builder.AppendState(3479, 0);              // 9  WORLDSTATE_SHOW_CRATES
+                builder.AppendState(3480, 0);              // 10 WORLDSTATE_CRATES_REVEALED
+                builder.AppendState(3504, 0);              // 11 WORLDSTATE_WAVE_COUNT
+                builder.AppendState(3931, 25);             // 12 WORLDSTATE_TIME_GUARDIAN
+                builder.AppendState(3932, 0);              // 13 WORLDSTATE_TIME_GUARDIAN_SHOW
             }
             break;
         // Ulduar
         case 4273:
             if (instance && mapid == 603)
-                instance->FillInitialWorldStates(data);
+                instance->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(4132) << uint32(0);              // 9  WORLDSTATE_ALGALON_TIMER_ENABLED
-                data << uint32(4131) << uint32(0);              // 10 WORLDSTATE_ALGALON_DESPAWN_TIMER
+                builder.AppendState(4132, 0);              // 9  WORLDSTATE_ALGALON_TIMER_ENABLED
+                builder.AppendState(4131, 0);              // 10 WORLDSTATE_ALGALON_DESPAWN_TIMER
             }
             break;
         // Zul Aman
         case 3805:
             if (instance && mapid == 568)
-                instance->FillInitialWorldStates(data);
+                instance->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(3104) << uint32(0);              // 9  WORLD_STATE_ZULAMAN_TIMER_ENABLED
-                data << uint32(3106) << uint32(0);              // 10 WORLD_STATE_ZULAMAN_TIMER
+                builder.AppendState(3104, 0);              // 9  WORLD_STATE_ZULAMAN_TIMER_ENABLED
+                builder.AppendState(3106, 0);              // 10 WORLD_STATE_ZULAMAN_TIMER
             }
             break;
         // Twin Peaks
         case 5031:
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_TP)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(0x62d) << uint32(0x0);       //  7 1581 alliance flag captures
-                data << uint32(0x62e) << uint32(0x0);       //  8 1582 horde flag captures
-                data << uint32(0x609) << uint32(0x0);       //  9 1545 unk
-                data << uint32(0x60a) << uint32(0x0);       // 10 1546 unk
-                data << uint32(0x60b) << uint32(0x2);       // 11 1547 unk
-                data << uint32(0x641) << uint32(0x3);       // 12 1601 unk
-                data << uint32(0x922) << uint32(0x1);       // 13 2338 horde (0 - hide, 1 - flag ok, 2 - flag picked up (flashing), 3 - flag picked up (not flashing)
-                data << uint32(0x923) << uint32(0x1);       // 14 2339 alliance (0 - hide, 1 - flag ok, 2 - flag picked up (flashing), 3 - flag picked up (not flashing)
+                builder.AppendState(0x62d, 0x0);       //  7 1581 alliance flag captures
+                builder.AppendState(0x62e, 0x0);       //  8 1582 horde flag captures
+                builder.AppendState(0x609, 0x0);       //  9 1545 unk
+                builder.AppendState(0x60a, 0x0);       // 10 1546 unk
+                builder.AppendState(0x60b, 0x2);       // 11 1547 unk
+                builder.AppendState(0x641, 0x3);       // 12 1601 unk
+                builder.AppendState(0x922, 0x1);       // 13 2338 horde (0 - hide, 1 - flag ok, 2 - flag picked up (flashing), 3 - flag picked up (not flashing)
+                builder.AppendState(0x923, 0x1);       // 14 2339 alliance (0 - hide, 1 - flag ok, 2 - flag picked up (flashing), 3 - flag picked up (not flashing)
             }
             break;
         // Battle for Gilneas
         case 5449:
             if (bg && bg->GetTypeID(true) == BATTLEGROUND_BFG)
-                bg->FillInitialWorldStates(data);
+                bg->FillInitialWorldStates(builder);
             break;
         // Wintergrasp
         case 4197:
             if (bf && bf->GetTypeId() == BATTLEFIELD_WG)
             {
-                bf->FillInitialWorldStates(data);
+                bf->FillInitialWorldStates(builder);
                 break;
             }
         case 4820:
             if (instance && mapid == 668)
-                instance->FillInitialWorldStates(data);
+                instance->FillInitialWorldStates(builder);
             else
             {
-                data << uint32(4884) << uint32(0);              // 9  WORLD_STATE_HOR_WAVES_ENABLED
-                data << uint32(4882) << uint32(0);              // 10 WORLD_STATE_HOR_WAVE_COUNT
+                builder.AppendState(4884, 0);              // 9  WORLD_STATE_HOR_WAVES_ENABLED
+                builder.AppendState(4882, 0);              // 10 WORLD_STATE_HOR_WAVE_COUNT
             }
             break;
 
             // No break here, intended.
         default:
-            data << uint32(0x914) << uint32(0x0);           // 7
-            data << uint32(0x913) << uint32(0x0);           // 8
-            data << uint32(0x912) << uint32(0x0);           // 9
-            data << uint32(0x915) << uint32(0x0);           // 10
+            builder.AppendState(0x914, 0x0);           // 7
+            builder.AppendState(0x913, 0x0);           // 8
+            builder.AppendState(0x912, 0x0);           // 9
+            builder.AppendState(0x915, 0x0);           // 10
             break;
     }
 
-    uint16 length = (data.wpos() - countPos) / 8;
-    data.put<uint16>(countPos, length);
 
-    GetSession()->SendPacket(&data);
+    builder.SendPacket(GetSession());
     SendBGWeekendWorldStates();
     SendBattlefieldWorldStates();
 }
@@ -9993,8 +10202,27 @@ uint32 Player::GetXPRestBonus(uint32 xp)
 
 void Player::SetBindPoint(uint64 guid)
 {
-    WorldPacket data(SMSG_BINDER_CONFIRM, 8);
-    data << uint64(guid);
+    ObjectGuid ikGuid = guid;
+
+    WorldPacket data(SMSG_BINDER_CONFIRM, 9);
+    data.WriteBit(ikGuid[4]);
+    data.WriteBit(ikGuid[6]);
+    data.WriteBit(ikGuid[2]);
+    data.WriteBit(ikGuid[1]);
+    data.WriteBit(ikGuid[5]);
+    data.WriteBit(ikGuid[3]);
+    data.WriteBit(ikGuid[0]);
+    data.WriteBit(ikGuid[7]);
+    data.FlushBits();
+
+    data.WriteByteSeq(ikGuid[6]);
+    data.WriteByteSeq(ikGuid[2]);
+    data.WriteByteSeq(ikGuid[5]);
+    data.WriteByteSeq(ikGuid[0]);
+    data.WriteByteSeq(ikGuid[4]);
+    data.WriteByteSeq(ikGuid[7]);
+    data.WriteByteSeq(ikGuid[1]);
+    data.WriteByteSeq(ikGuid[3]);
     GetSession()->SendPacket(&data);
 }
 
@@ -10146,7 +10374,27 @@ uint8 Player::FindEquipSlot(ItemTemplate const* proto, uint32 slot, bool swap) c
             slots[0] = EQUIPMENT_SLOT_OFFHAND;
             break;
         case INVTYPE_RANGED:
-            slots[0] = EQUIPMENT_SLOT_RANGED;
+            slots[0] = EQUIPMENT_SLOT_MAINHAND;
+            if (Item* mhWeapon = GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND))
+            {
+                if (ItemTemplate const* mhWeaponProto = mhWeapon->GetTemplate())
+                {
+                    if (mhWeaponProto->SubClass == ITEM_SUBCLASS_WEAPON_POLEARM || mhWeaponProto->SubClass == ITEM_SUBCLASS_WEAPON_STAFF)
+                    {
+                        const_cast<Player*>(this)->AutoUnequipOffhandIfNeed(true);
+                        break;
+                    }
+                }
+            }
+
+            if (GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND))
+            {
+                if (proto->SubClass == ITEM_SUBCLASS_WEAPON_POLEARM || proto->SubClass == ITEM_SUBCLASS_WEAPON_STAFF)
+                {
+                    const_cast<Player*>(this)->AutoUnequipOffhandIfNeed(true);
+                    break;
+                }
+            }
             break;
         case INVTYPE_2HWEAPON:
             slots[0] = EQUIPMENT_SLOT_MAINHAND;
@@ -10186,10 +10434,51 @@ uint8 Player::FindEquipSlot(ItemTemplate const* proto, uint32 slot, bool swap) c
             slots[0] = EQUIPMENT_SLOT_OFFHAND;
             break;
         case INVTYPE_THROWN:
-            slots[0] = EQUIPMENT_SLOT_RANGED;
+            slots[0] = EQUIPMENT_SLOT_MAINHAND;
+            slots[0] = EQUIPMENT_SLOT_MAINHAND;
+            if (Item* mhWeapon = GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND))
+            {
+                if (ItemTemplate const* mhWeaponProto = mhWeapon->GetTemplate())
+                {
+                    if (mhWeaponProto->SubClass == ITEM_SUBCLASS_WEAPON_POLEARM || mhWeaponProto->SubClass == ITEM_SUBCLASS_WEAPON_STAFF)
+                    {
+                        const_cast<Player*>(this)->AutoUnequipOffhandIfNeed(true);
+                        break;
+                    }
+                }
+            }
+
+            if (GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND))
+            {
+                if (proto->SubClass == ITEM_SUBCLASS_WEAPON_POLEARM || proto->SubClass == ITEM_SUBCLASS_WEAPON_STAFF)
+                {
+                    const_cast<Player*>(this)->AutoUnequipOffhandIfNeed(true);
+                    break;
+                }
+            }
             break;
         case INVTYPE_RANGEDRIGHT:
-            slots[0] = EQUIPMENT_SLOT_RANGED;
+            slots[0] = EQUIPMENT_SLOT_MAINHAND;
+            if (Item* mhWeapon = GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND))
+            {
+                if (ItemTemplate const* mhWeaponProto = mhWeapon->GetTemplate())
+                {
+                    if (mhWeaponProto->SubClass == ITEM_SUBCLASS_WEAPON_POLEARM || mhWeaponProto->SubClass == ITEM_SUBCLASS_WEAPON_STAFF)
+                    {
+                        const_cast<Player*>(this)->AutoUnequipOffhandIfNeed(true);
+                        break;
+                    }
+                }
+            }
+
+            if (GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND))
+            {
+                if (proto->SubClass == ITEM_SUBCLASS_WEAPON_POLEARM || proto->SubClass == ITEM_SUBCLASS_WEAPON_STAFF)
+                {
+                    const_cast<Player*>(this)->AutoUnequipOffhandIfNeed(true);
+                    break;
+                }
+            }
             break;
         case INVTYPE_BAG:
             slots[0] = INVENTORY_SLOT_BAG_START + 0;
@@ -10201,7 +10490,29 @@ uint8 Player::FindEquipSlot(ItemTemplate const* proto, uint32 slot, bool swap) c
         {
            if (playerClass == CLASS_PALADIN || playerClass == CLASS_DRUID ||
                playerClass == CLASS_SHAMAN || playerClass == CLASS_DEATH_KNIGHT)
-               slots[0] = EQUIPMENT_SLOT_RANGED;
+           {
+               slots[0] = EQUIPMENT_SLOT_MAINHAND;
+               if (Item* mhWeapon = GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND))
+               {
+                   if (ItemTemplate const* mhWeaponProto = mhWeapon->GetTemplate())
+                   {
+                       if (mhWeaponProto->SubClass == ITEM_SUBCLASS_WEAPON_POLEARM || mhWeaponProto->SubClass == ITEM_SUBCLASS_WEAPON_STAFF)
+                       {
+                           const_cast<Player*>(this)->AutoUnequipOffhandIfNeed(true);
+                           break;
+                       }
+                   }
+               }
+
+               if (GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND))
+               {
+                   if (proto->SubClass == ITEM_SUBCLASS_WEAPON_POLEARM || proto->SubClass == ITEM_SUBCLASS_WEAPON_STAFF)
+                   {
+                       const_cast<Player*>(this)->AutoUnequipOffhandIfNeed(true);
+                       break;
+                   }
+               }
+           }
            break;
         }
         default:
@@ -11966,7 +12277,7 @@ InventoryResult Player::CanRollForItemInLFG(ItemTemplate const* proto, WorldObje
     {
         if (_class == CLASS_WARRIOR || _class == CLASS_PALADIN || _class == CLASS_DEATH_KNIGHT)
         {
-            if (getLevel() < 40)
+            if (getLevel() < 50)
             {
                 if (proto->SubClass != ITEM_SUBCLASS_ARMOR_MAIL)
                     return EQUIP_ERR_CLIENT_LOCKED_OUT;
@@ -11976,12 +12287,22 @@ InventoryResult Player::CanRollForItemInLFG(ItemTemplate const* proto, WorldObje
         }
         else if (_class == CLASS_HUNTER || _class == CLASS_SHAMAN)
         {
-            if (getLevel() < 40)
+            if (getLevel() < 50)
             {
                 if (proto->SubClass != ITEM_SUBCLASS_ARMOR_LEATHER)
                     return EQUIP_ERR_CLIENT_LOCKED_OUT;
             }
             else if (proto->SubClass != ITEM_SUBCLASS_ARMOR_MAIL)
+                return EQUIP_ERR_CLIENT_LOCKED_OUT;
+        }
+        else if (_class == CLASS_MONK)
+        {
+            if (getLevel() < 50)
+            {
+                if (proto->SubClass != ITEM_SUBCLASS_ARMOR_CLOTH)
+                    return EQUIP_ERR_CLIENT_LOCKED_OUT;
+            }
+            else if (proto->SubClass != ITEM_SUBCLASS_LEATHER)
                 return EQUIP_ERR_CLIENT_LOCKED_OUT;
         }
 
@@ -12217,12 +12538,31 @@ Item* Player::EquipItem(uint16 pos, Item* pItem, bool update)
                     m_weaponChangeTimer = spellProto->StartRecoveryTime;
 
                     GetGlobalCooldownMgr().AddGlobalCooldown(spellProto, m_weaponChangeTimer);
+                    ObjectGuid guid = GetGUID();
 
-                    WorldPacket data(SMSG_SPELL_COOLDOWN, 8+1+4);
-                    data << uint64(GetGUID());
-                    data << uint8(1);
+                    WorldPacket data(SMSG_SPELL_COOLDOWN, 9 + 3 + 8);
+                    data.WriteBit(guid[0]);
+                    data.WriteBit(guid[6]);
+                    data.WriteBit(1); // Missing flags
+                    data.WriteBit(guid[7]);
+                    data.WriteBit(guid[3]);
+                    data.WriteBit(guid[1]);
+                    data.WriteBit(guid[5]);
+                    size_t bitpos = data.bitwpos();
+                    data.WriteBits(1, 21);
+                    data.WriteBit(guid[2]);
+                    data.WriteBit(guid[4]);
+
                     data << uint32(cooldownSpell);
                     data << uint32(0);
+                    data.WriteByteSeq(guid[5]);
+                    data.WriteByteSeq(guid[3]);
+                    data.WriteByteSeq(guid[7]);
+                    data.WriteByteSeq(guid[4]);
+                    data.WriteByteSeq(guid[1]);
+                    data.WriteByteSeq(guid[0]);
+                    data.WriteByteSeq(guid[2]);
+                    data.WriteByteSeq(guid[6]);
                     GetSession()->SendPacket(&data);
                 }
             }
@@ -13403,63 +13743,150 @@ void Player::RemoveItemFromBuyBackSlot(uint32 slot, bool del)
 void Player::SendEquipError(InventoryResult msg, Item* pItem, Item* pItem2, uint32 itemid)
 {
     TC_LOG_DEBUG("network", "WORLD: Sent SMSG_INVENTORY_CHANGE_FAILURE (%u)", msg);
+
+    ObjectGuid pItemGuid = pItem ? pItem->GetGUID() : 0;
+    ObjectGuid pItemGuid2 = pItem2 ? pItem2->GetGUID() : 0;
+
     WorldPacket data(SMSG_INVENTORY_CHANGE_FAILURE, (msg == EQUIP_ERR_CANT_EQUIP_LEVEL_I ? 22 : 18));
-    data << uint8(msg);
 
     if (msg != EQUIP_ERR_OK)
     {
-        data << uint64(pItem ? pItem->GetGUID() : 0);
-        data << uint64(pItem2 ? pItem2->GetGUID() : 0);
-        data << uint8(0);                                   // bag type subclass, used with EQUIP_ERR_EVENT_AUTOEQUIP_BIND_CONFIRM and EQUIP_ERR_ITEM_DOESNT_GO_INTO_BAG2
+        data.WriteBit(pItemGuid2[4]);
+        data.WriteBit(pItemGuid[3]);
+        data.WriteBit(pItemGuid2[6]);
+        data.WriteBit(pItemGuid2[2]);
+        data.WriteBit(pItemGuid[4]);
+        data.WriteBit(pItemGuid2[5]);
+        data.WriteBit(pItemGuid[1]);
+        data.WriteBit(pItemGuid[6]);
+        data.WriteBit(pItemGuid2[0]);
+        data.WriteBit(pItemGuid2[3]);
+        data.WriteBit(pItemGuid2[1]);
+        data.WriteBit(pItemGuid[2]);
+        data.WriteBit(pItemGuid[0]);
+        data.WriteBit(pItemGuid[5]);
+        data.WriteBit(pItemGuid[7]);
+        data.WriteBit(pItemGuid2[7]);
 
-        switch (msg)
+        data.WriteByteSeq(pItemGuid2[0]);
+        data << uint8(0);                       // bag type subclass, used with EQUIP_ERR_EVENT_AUTOEQUIP_BIND_CONFIRM and EQUIP_ERR_ITEM_DOESNT_GO_INTO_BAG2
+        data.WriteByteSeq(pItemGuid2[6]);
+        data.WriteByteSeq(pItemGuid[4]);
+        data.WriteByteSeq(pItemGuid[0]);
+        data.WriteByteSeq(pItemGuid[7]);
+        data.WriteByteSeq(pItemGuid[3]);
+        data.WriteByteSeq(pItemGuid2[1]);
+        data.WriteByteSeq(pItemGuid2[5]);
+        data.WriteByteSeq(pItemGuid[5]);
+        data.WriteByteSeq(pItemGuid2[7]);
+        data.WriteByteSeq(pItemGuid2[2]);
+        data.WriteByteSeq(pItemGuid[1]);
+        data.WriteByteSeq(pItemGuid[6]);
+        data.WriteByteSeq(pItemGuid[2]);
+        data.WriteByteSeq(pItemGuid2[3]);
+        data.WriteByteSeq(pItemGuid2[4]);
+        data << uint8(msg);
+
+        if (msg == EQUIP_ERR_ITEM_MAX_LIMIT_CATEGORY_COUNT_EXCEEDED_IS
+            || msg == EQUIP_ERR_ITEM_MAX_LIMIT_CATEGORY_SOCKETED_EXCEEDED_IS
+            || msg == EQUIP_ERR_ITEM_MAX_LIMIT_CATEGORY_EQUIPPED_EXCEEDED_IS)
         {
-            case EQUIP_ERR_CANT_EQUIP_LEVEL_I:
-            case EQUIP_ERR_PURCHASE_LEVEL_TOO_LOW:
-            {
-                ItemTemplate const* proto = pItem ? pItem->GetTemplate() : sObjectMgr->GetItemTemplate(itemid);
-                data << uint32(proto ? proto->RequiredLevel : 0);
-                break;
-            }
-            case EQUIP_ERR_NO_OUTPUT:    // no idea about this one...
-            {
-                data << uint64(0); // item guid
-                data << uint32(0); // slot
-                data << uint64(0); // container
-                break;
-            }
-            case EQUIP_ERR_ITEM_MAX_LIMIT_CATEGORY_COUNT_EXCEEDED_IS:
-            case EQUIP_ERR_ITEM_MAX_LIMIT_CATEGORY_SOCKETED_EXCEEDED_IS:
-            case EQUIP_ERR_ITEM_MAX_LIMIT_CATEGORY_EQUIPPED_EXCEEDED_IS:
-            {
-                ItemTemplate const* proto = pItem ? pItem->GetTemplate() : sObjectMgr->GetItemTemplate(itemid);
-                data << uint32(proto ? proto->ItemLimitCategory : 0);
-                break;
-            }
-            default:
-                break;
+            ItemTemplate const* proto = pItem ? pItem->GetTemplate() : sObjectMgr->GetItemTemplate(itemid);
+            data << uint32(proto ? proto->ItemLimitCategory : 0);
+        }
+
+        if (msg == EQUIP_ERR_NO_OUTPUT)         // no idea about this one...
+            data << uint32(0);                  // slot
+
+        if (msg == EQUIP_ERR_CANT_EQUIP_LEVEL_I || msg == EQUIP_ERR_PURCHASE_LEVEL_TOO_LOW)
+        {
+            ItemTemplate const* proto = pItem ? pItem->GetTemplate() : sObjectMgr->GetItemTemplate(itemid);
+            data << uint32(proto ? proto->RequiredLevel : 0);
+        }
+
+        if (msg == EQUIP_ERR_NO_OUTPUT)
+        {
+            data.WriteBits(0, 8);               // container
+            data.WriteBits(0, 8);               // item guid
         }
     }
+
     GetSession()->SendPacket(&data);
 }
 
 void Player::SendBuyError(BuyResult msg, Creature* creature, uint32 item, uint32 /*param*/)
 {
     TC_LOG_DEBUG("network", "WORLD: Sent SMSG_BUY_FAILED");
-    WorldPacket data(SMSG_BUY_FAILED, (8+4+4+1));
-    data << uint64(creature ? creature->GetGUID() : 0);
-    data << uint32(item);
+
+    ObjectGuid guid = creature ? creature->GetGUID() : 0;
+
+    WorldPacket data(SMSG_BUY_FAILED, 1 + 8 + 1 + 4);
+    data.WriteBit(guid[6]);
+    data.WriteBit(guid[3]);
+    data.WriteBit(guid[1]);
+    data.WriteBit(guid[2]);
+    data.WriteBit(guid[4]);
+    data.WriteBit(guid[5]);
+    data.WriteBit(guid[0]);
+    data.WriteBit(guid[7]);
+
     data << uint8(msg);
+    data.WriteByteSeq(guid[2]);
+    data.WriteByteSeq(guid[7]);
+    data << uint32(item);
+    data.WriteByteSeq(guid[4]);
+    data.WriteByteSeq(guid[5]);
+    data.WriteByteSeq(guid[1]);
+    data.WriteByteSeq(guid[3]);
+    data.WriteByteSeq(guid[6]);
+    data.WriteByteSeq(guid[0]);
+
     GetSession()->SendPacket(&data);
 }
 
 void Player::SendSellError(SellResult msg, Creature* creature, uint64 guid)
 {
     TC_LOG_DEBUG("network", "WORLD: Sent SMSG_SELL_ITEM");
-    WorldPacket data(SMSG_SELL_ITEM, (8+8+1));  // last check 4.3.4
-    data << uint64(creature ? creature->GetGUID() : 0);
-    data << uint64(guid);
+
+    ObjectGuid npcGuid = creature ? creature->GetGUID() : 0;
+    ObjectGuid itemGuid = guid;
+
+    WorldPacket data(SMSG_SELL_ITEM, 1 + 8 + 1 + 8 + 1);
+    data.WriteBit(itemGuid[2]);
+    data.WriteBit(npcGuid[4]);
+    data.WriteBit(itemGuid[5]);
+    data.WriteBit(itemGuid[4]);
+    data.WriteBit(npcGuid[3]);
+    data.WriteBit(npcGuid[5]);
+    data.WriteBit(itemGuid[3]);
+    data.WriteBit(npcGuid[6]);
+    data.WriteBit(npcGuid[0]);
+    data.WriteBit(npcGuid[2]);
+    data.WriteBit(itemGuid[1]);
+    data.WriteBit(itemGuid[7]);
+    data.WriteBit(npcGuid[1]);
+    data.WriteBit(itemGuid[0]);
+    data.WriteBit(itemGuid[6]);
+    data.WriteBit(npcGuid[7]);
+
+    data.WriteByteSeq(itemGuid[4]);
+    data.WriteByteSeq(itemGuid[1]);
     data << uint8(msg);
+    data.WriteByteSeq(itemGuid[2]);
+    data.WriteByteSeq(npcGuid[4]);
+    data.WriteByteSeq(npcGuid[0]);
+    data.WriteByteSeq(npcGuid[5]);
+    data.WriteByteSeq(npcGuid[2]);
+    data.WriteByteSeq(itemGuid[0]);
+    data.WriteByteSeq(npcGuid[3]);
+    data.WriteByteSeq(itemGuid[5]);
+    data.WriteByteSeq(itemGuid[6]);
+    data.WriteByteSeq(itemGuid[7]);
+    data.WriteByteSeq(npcGuid[6]);
+    data.WriteByteSeq(npcGuid[1]);
+    data.WriteByteSeq(itemGuid[3]);
+    data.WriteByteSeq(npcGuid[7]);
+
     GetSession()->SendPacket(&data);
 }
 
@@ -13676,7 +14103,7 @@ void Player::ApplyReforgeEnchantment(Item* item, bool apply)
     if (!item)
         return;
 
-    ItemReforgeEntry const* reforge = sItemReforgeStore.LookupEntry(item->GetEnchantmentId(REFORGE_ENCHANTMENT_SLOT));
+    ItemReforgeEntry const* reforge = sItemReforgeStore.LookupEntry(item->GetDynamicUInt32Value(ITEM_DYNAMIC_MODIFIERS, 0));
     if (!reforge)
         return;
 
@@ -13914,14 +14341,10 @@ void Player::ApplyEnchantment(Item* item, bool apply)
 {
     for (uint32 slot = 0; slot < MAX_ENCHANTMENT_SLOT; ++slot)
     {
-        // Apply reforge as last enchant
-        if (slot == REFORGE_ENCHANTMENT_SLOT)
-            continue;
-
         ApplyEnchantment(item, EnchantmentSlot(slot), apply);
     }
 
-    ApplyEnchantment(item, REFORGE_ENCHANTMENT_SLOT, apply);
+    ApplyReforgeEnchantment(item, apply);
 }
 
 void Player::ApplyEnchantment(Item* item, EnchantmentSlot slot, bool apply, bool apply_dur, bool ignore_condition)
@@ -13931,15 +14354,6 @@ void Player::ApplyEnchantment(Item* item, EnchantmentSlot slot, bool apply, bool
 
     if (slot >= MAX_ENCHANTMENT_SLOT)
         return;
-
-    if (slot == TRANSMOGRIFY_ENCHANTMENT_SLOT)
-        return;
-
-    if (slot == REFORGE_ENCHANTMENT_SLOT)
-    {
-        ApplyReforgeEnchantment(item, apply);
-        return;
-    }
 
     uint32 enchant_id = item->GetEnchantmentId(slot);
     if (!enchant_id)
@@ -14367,23 +14781,64 @@ void Player::SendItemDurations()
 
 void Player::SendNewItem(Item* item, uint32 count, bool received, bool created, bool broadcast)
 {
-    if (!item)                                               // prevent crash
+    if (!item)                                              // prevent crash
         return;
 
-                                                            // last check 2.0.10
-    WorldPacket data(SMSG_ITEM_PUSH_RESULT, (8+4+4+4+1+4+4+4+4+4));
-    data << uint64(GetGUID());                              // player GUID
-    data << uint32(received);                               // 0=looted, 1=from npc
-    data << uint32(created);                                // 0=received, 1=created
-    data << uint32(1);                                      // bool print error to chat
-    data << uint8(item->GetBagSlot());                      // bagslot
-                                                            // item slot, but when added to stack: 0xFFFFFFFF
-    data << uint32((item->GetCount() == count) ? item->GetSlot() : -1);
+    uint32 itemSlot = (item->GetCount() == count) ? item->GetSlot() : -1;
+
+    ObjectGuid playerGuid = GetGUID();
+    ObjectGuid itemGuid = item->GetGUID();
+
+    WorldPacket data(SMSG_ITEM_PUSH_RESULT, 1 + 8 + 1 + 4 + 4 + 4 + 4 + 4 + 4 + 1 + 4 + 4 + 4);
+    data.WriteBit(itemGuid[2]);
+    data.WriteBit(playerGuid[4]);
+    data.WriteBit(itemGuid[5]);
+    data.WriteBit(1);                                       // display in chat
+    data.WriteBit(playerGuid[1]);
+    data.WriteBit(received);                                // 0 = looted, 1 = npc
+    data.WriteBit(itemGuid[4]);
+    data.WriteBit(playerGuid[6]);
+    data.WriteBit(playerGuid[5]);
+    data.WriteBit(playerGuid[7]);
+    data.WriteBit(playerGuid[0]);
+    data.WriteBit(itemGuid[0]);
+    data.WriteBit(itemGuid[7]);
+    data.WriteBit(playerGuid[2]);
+    data.WriteBit(itemGuid[6]);
+    data.WriteBit(0);                                       // bonus loot
+    data.WriteBit(playerGuid[3]);
+    data.WriteBit(itemGuid[1]);
+    data.WriteBit(created);                                 // 0 = received. 1 = created
+    data.WriteBit(itemGuid[3]);
+    data.FlushBits();
+
+    data.WriteByteSeq(playerGuid[1]);
+    data.WriteByteSeq(itemGuid[1]);
+    data << uint32(0);                                      // battle pet species
+    data.WriteByteSeq(itemGuid[0]);
+    data.WriteByteSeq(playerGuid[5]);
+    data.WriteByteSeq(playerGuid[2]);
+    data << uint32(item->GetItemSuffixFactor());            // suffix factor
+    data.WriteByteSeq(itemGuid[7]);
+    data << uint32(0);                                      // battle pet quality
     data << uint32(item->GetEntry());                       // item id
-    data << uint32(item->GetItemSuffixFactor());            // SuffixFactor
     data << int32(item->GetItemRandomPropertyId());         // random item property id
-    data << uint32(count);                                  // count of items
+    data.WriteByteSeq(itemGuid[6]);
+    data << uint32(0);                                      // battle pet breed
     data << uint32(GetItemCount(item->GetEntry()));         // count of items in inventory
+    data.WriteByteSeq(itemGuid[2]);
+    data.WriteByteSeq(playerGuid[0]);
+    data << uint32(count);                                  // count of items
+    data.WriteByteSeq(playerGuid[5]);
+    data.WriteByteSeq(itemGuid[5]);
+    data.WriteByteSeq(playerGuid[4]);
+    data << uint8(item->GetBagSlot());                      // bag slot
+    data << uint32(itemSlot);                               // item slot, but when added to stack: 0xFFFFFFFF
+    data.WriteByteSeq(playerGuid[3]);
+    data.WriteByteSeq(playerGuid[6]);
+    data << uint32(0);                                      // battle pet level
+    data.WriteByteSeq(itemGuid[3]);
+    data.WriteByteSeq(itemGuid[4]);
 
     if (broadcast && GetGroup())
         GetGroup()->BroadcastPacket(&data, true);
@@ -15140,15 +15595,15 @@ bool Player::CanRewardQuest(Quest const* quest, uint32 reward, bool msg)
 
     if (quest->GetRewChoiceItemsCount() > 0)
     {
-        if (quest->RewardChoiceItemId[reward])
+        if (!quest->IsRewChoiceItemValid(reward))
+            return false;
+
+        ItemPosCountVec dest;
+        InventoryResult res = CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, reward, quest->GetRewChoiceItemCount(reward));
+        if (res != EQUIP_ERR_OK)
         {
-            ItemPosCountVec dest;
-            InventoryResult res = CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, quest->RewardChoiceItemId[reward], quest->RewardChoiceItemCount[reward]);
-            if (res != EQUIP_ERR_OK)
-            {
-                SendEquipError(res, NULL, NULL, quest->RewardChoiceItemId[reward]);
-                return false;
-            }
+            SendEquipError(res, NULL, NULL, reward);
+            return false;
         }
     }
 
@@ -15306,14 +15761,11 @@ void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, 
 
     if (quest->GetRewChoiceItemsCount() > 0)
     {
-        if (uint32 itemId = quest->RewardChoiceItemId[reward])
+        ItemPosCountVec dest;
+        if (CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, reward, quest->GetRewChoiceItemCount(reward)) == EQUIP_ERR_OK)
         {
-            ItemPosCountVec dest;
-            if (CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, quest->RewardChoiceItemCount[reward]) == EQUIP_ERR_OK)
-            {
-                Item* item = StoreNewItem(dest, itemId, true, Item::GenerateItemRandomPropertyId(itemId));
-                SendNewItem(item, quest->RewardChoiceItemCount[reward], true, false);
-            }
+            Item* item = StoreNewItem(dest, reward, true, Item::GenerateItemRandomPropertyId(reward));
+            SendNewItem(item, quest->GetRewChoiceItemCount(reward), true, false);
         }
     }
 
@@ -16177,7 +16629,6 @@ void Player::SetQuestSlot(uint16 slot, uint32 quest_id, uint32 timer /*= 0*/)
     SetUInt32Value(PLAYER_FIELD_QUEST_LOG + slot * MAX_QUEST_OFFSET + QUEST_ID_OFFSET, quest_id);
     SetUInt32Value(PLAYER_FIELD_QUEST_LOG + slot * MAX_QUEST_OFFSET + QUEST_STATE_OFFSET, 0);
     SetUInt32Value(PLAYER_FIELD_QUEST_LOG + slot * MAX_QUEST_OFFSET + QUEST_COUNTS_OFFSET, 0);
-    SetUInt32Value(PLAYER_FIELD_QUEST_LOG + slot * MAX_QUEST_OFFSET + QUEST_COUNTS_OFFSET + 1, 0);
     SetUInt32Value(PLAYER_FIELD_QUEST_LOG + slot * MAX_QUEST_OFFSET + QUEST_TIME_OFFSET, timer);
 }
 
@@ -16739,18 +17190,17 @@ void Player::SendQuestReward(Quest const* quest, uint32 XP)
         moneyReward = uint32(quest->GetRewOrReqMoney() + int32(quest->GetRewMoneyMaxLevel() * sWorld->getRate(RATE_DROP_MONEY)));
     }
 
-    WorldPacket data(SMSG_QUESTGIVER_QUEST_COMPLETE, (4+4+4+4+4));
+    WorldPacket data(SMSG_QUESTGIVER_QUEST_COMPLETE, 4 + 4 + 4 + 4 + 4 + 4 + 1);
+    data.WriteBit(1);                                      // FIXME: unknown bits, common values sent
+    data.WriteBit(0);
+    data.FlushBits();
 
-    data << uint32(quest->GetBonusTalents());              // bonus talents (not verified for 4.x)
-    data << uint32(quest->GetRewardSkillPoints());         // 4.x bonus skill points
+    data << uint32(quest->GetBonusTalents());              // bonus talents (still sent to 5.4.x client)
     data << uint32(moneyReward);
-    data << uint32(xp);
     data << uint32(questId);
     data << uint32(quest->GetRewardSkillId());             // 4.x bonus skill id
-
-    data.WriteBit(0);                                      // FIXME: unknown bits, common values sent
-    data.WriteBit(1);
-    data.FlushBits();
+    data << uint32(xp);
+    data << uint32(quest->GetRewardSkillPoints());         // 4.x bonus skill points
 
     GetSession()->SendPacket(&data);
 }
@@ -16797,10 +17247,32 @@ void Player::SendQuestConfirmAccept(const Quest* quest, Player* pReceiver)
             if (const QuestLocale* pLocale = sObjectMgr->GetQuestLocale(quest->GetQuestId()))
                 ObjectMgr::GetLocaleString(pLocale->Title, loc_idx, strTitle);
 
-        WorldPacket data(SMSG_QUEST_CONFIRM_ACCEPT, (4 + strTitle.size() + 8));
+        ObjectGuid guid = GetGUID();
+
+        WorldPacket data(SMSG_QUEST_CONFIRM_ACCEPT, 1 + 8 + 2 + strTitle.size() + 4);
+        data.WriteBit(guid[0]);
+        data.WriteBit(guid[3]);
+        data.WriteBit(0);       // has quest title
+        data.WriteBit(guid[2]);
+        data.WriteBit(guid[5]);
+        data.WriteBit(guid[6]);
+        data.WriteBit(guid[4]);
+        data.WriteBit(guid[1]);
+        data.WriteBits(strTitle.size(), 10);
+        data.WriteBit(guid[7]);
+        data.FlushBits();
+
+        data.WriteByteSeq(guid[6]);
+        data.WriteString(strTitle);
+        data.WriteByteSeq(guid[0]);
+        data.WriteByteSeq(guid[5]);
+        data.WriteByteSeq(guid[3]);
+        data.WriteByteSeq(guid[1]);
+        data.WriteByteSeq(guid[4]);
+        data.WriteByteSeq(guid[2]);
+        data.WriteByteSeq(guid[7]);
         data << uint32(quest->GetQuestId());
-        data << strTitle;
-        data << uint64(GetGUID());
+
         pReceiver->GetSession()->SendPacket(&data);
 
         TC_LOG_DEBUG("network", "WORLD: Sent SMSG_QUEST_CONFIRM_ACCEPT");
@@ -16828,14 +17300,35 @@ void Player::SendQuestUpdateAddCreatureOrGo(Quest const* quest, uint64 guid, uin
         // client expected gameobject template id in form (id|0x80000000)
         entry = (-entry) | 0x80000000;
 
-    WorldPacket data(SMSG_QUESTUPDATE_ADD_KILL, (4*4+8));
-    TC_LOG_DEBUG("network", "WORLD: Sent SMSG_QUESTUPDATE_ADD_KILL");
+    ObjectGuid oGuid = guid;
+
+    WorldPacket data(SMSG_QUESTUPDATE_ADD_KILL, 1 + 8 + 2 + 1 + 4 + 2 + 4);
+    data << uint16(old_count + add_count);
+    data << uint8(0);
     data << uint32(quest->GetQuestId());
+    data << uint16(quest->RequiredNpcOrGoCount[creatureOrGO_idx]);
     data << uint32(entry);
-    data << uint32(old_count + add_count);
-    data << uint32(quest->RequiredNpcOrGoCount[ creatureOrGO_idx ]);
-    data << uint64(guid);
+
+    data.WriteBit(oGuid[0]);
+    data.WriteBit(oGuid[4]);
+    data.WriteBit(oGuid[2]);
+    data.WriteBit(oGuid[6]);
+    data.WriteBit(oGuid[1]);
+    data.WriteBit(oGuid[5]);
+    data.WriteBit(oGuid[7]);
+    data.WriteBit(oGuid[3]);
+
+    data.WriteByteSeq(oGuid[2]);
+    data.WriteByteSeq(oGuid[7]);
+    data.WriteByteSeq(oGuid[3]);
+    data.WriteByteSeq(oGuid[0]);
+    data.WriteByteSeq(oGuid[4]);
+    data.WriteByteSeq(oGuid[5]);
+    data.WriteByteSeq(oGuid[1]);
+    data.WriteByteSeq(oGuid[6]);
+
     GetSession()->SendPacket(&data);
+    TC_LOG_DEBUG("network", "WORLD: Sent SMSG_QUESTUPDATE_ADD_KILL");
 
     uint16 log_slot = FindQuestSlot(quest->GetQuestId());
     if (log_slot < MAX_QUEST_LOG_SIZE)
@@ -17147,7 +17640,7 @@ bool Player::LoadFromDB(uint32 guid, SQLQueryHolder *holder)
     SetByteValue(PLAYER_FIELD_ARENA_FACTION, 1, fields[45].GetUInt8());
     SetUInt32Value(PLAYER_FIELD_PLAYER_FLAGS, fields[11].GetUInt32());
     SetInt32Value(PLAYER_FIELD_WATCHED_FACTION_INDEX, fields[44].GetUInt32());
-    SetUInt32Value(PLAYER_FIELD_VIRTUAL_PLAYER_REALM, sConfigMgr->GetIntDefault("RealmID", 0));
+    SetUInt32Value(PLAYER_FIELD_VIRTUAL_PLAYER_REALM, realmID);
 
     // set which actionbars the client has active - DO NOT REMOVE EVER AGAIN (can be changed though, if it does change fieldwise)
     SetByteValue(PLAYER_FIELD_LIFETIME_MAX_RANK, 2, fields[58].GetUInt8());
@@ -17564,6 +18057,10 @@ bool Player::LoadFromDB(uint32 guid, SQLQueryHolder *holder)
 
     SetUInt32Value(PLAYER_FIELD_CURRENT_SPEC_ID, GetTalentSpecialization(GetActiveSpec()));
 
+    // must be loaded before spells
+    m_battlePetMgr->LoadFromDb(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_BATTLE_PETS));
+    m_battlePetMgr->LoadSlotsFromDb(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_BATTLE_PET_SLOTS));
+
     _LoadTalents(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_TALENTS));
     _LoadSpells(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_SPELLS));
 
@@ -17727,14 +18224,6 @@ bool Player::LoadFromDB(uint32 guid, SQLQueryHolder *holder)
     _LoadEquipmentSets(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_EQUIPMENT_SETS));
 
     _LoadCUFProfiles(holder->GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_CUF_PROFILES));
-
-    std::list<uint32> learnList = GetSpellsForLevels(getClass(), getRaceMask(), GetTalentSpecialization(GetActiveSpec()), 0, getLevel());
-    for (std::list<uint32>::const_iterator iter = learnList.begin(); iter != learnList.end(); iter++)
-    {
-        if (!HasSpell(*iter))
-            learnSpell(*iter, true);
-    }
-
     return true;
 }
 
@@ -17990,8 +18479,8 @@ void Player::_LoadInventory(PreparedQueryResult result, uint32 timeDiff)
             Field* fields = result->Fetch();
             if (Item* item = _LoadItem(trans, zoneId, timeDiff, fields))
             {
-                uint32 bagGuid  = fields[11].GetUInt32();
-                uint8  slot     = fields[12].GetUInt8();
+                uint32 bagGuid  = fields[13].GetUInt32();
+                uint8  slot     = fields[14].GetUInt8();
 
                 uint8 err = EQUIP_ERR_OK;
                 // Item is not in bag
@@ -18147,8 +18636,8 @@ void Player::_LoadVoidStorage(PreparedQueryResult result)
 Item* Player::_LoadItem(SQLTransaction& trans, uint32 zoneId, uint32 timeDiff, Field* fields)
 {
     Item* item = NULL;
-    uint32 itemGuid  = fields[13].GetUInt32();
-    uint32 itemEntry = fields[14].GetUInt32();
+    uint32 itemGuid  = fields[15].GetUInt32();
+    uint32 itemEntry = fields[16].GetUInt32();
     if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry))
     {
         bool remove = false;
@@ -18654,6 +19143,13 @@ void Player::_LoadSpells(PreparedQueryResult result)
         do
             addSpell((*result)[0].GetUInt32(), (*result)[1].GetBool(), false, false, (*result)[2].GetBool(), true);
         while (result->NextRow());
+    }
+
+    std::list<uint32> learnList = GetSpellsForLevels(getClass(), getRaceMask(), GetTalentSpecialization(GetActiveSpec()), 0, getLevel());
+    for (std::list<uint32>::const_iterator iter = learnList.begin(); iter != learnList.end(); iter++)
+    {
+        if (!HasSpell(*iter))
+            learnSpell(*iter, true);
     }
 }
 
@@ -19446,6 +19942,7 @@ void Player::SaveToDB(bool create /*=false*/)
     _SaveInstanceTimeRestrictions(trans);
     _SaveCurrency(trans);
     _SaveCUFProfiles(trans);
+    m_battlePetMgr->SaveToDb(trans);
 
     // check if stats should only be saved on logout
     // save stats can be out of transaction
@@ -20173,7 +20670,7 @@ void Player::outDebugValues() const
     TC_LOG_DEBUG("entities.unit", "AGILITY is: \t\t%f\t\tSTRENGTH is: \t\t%f", GetStat(STAT_AGILITY), GetStat(STAT_STRENGTH));
     TC_LOG_DEBUG("entities.unit", "INTELLECT is: \t\t%f\t\tSPIRIT is: \t\t%f", GetStat(STAT_INTELLECT), GetStat(STAT_SPIRIT));
     TC_LOG_DEBUG("entities.unit", "STAMINA is: \t\t%f", GetStat(STAT_STAMINA));
-    TC_LOG_DEBUG("entities.unit", "Armor is: \t\t%u\t\tBlock is: \t\t%f", GetArmor(), GetFloatValue(PLAYER_FIELD_PLAYER_FLAGS));
+    TC_LOG_DEBUG("entities.unit", "Armor is: \t\t%u\t\tBlock is: \t\t%f", GetArmor(), GetFloatValue(PLAYER_FIELD_BLOCK_PERCENTAGE));
     TC_LOG_DEBUG("entities.unit", "HolyRes is: \t\t%u\t\tFireRes is: \t\t%u", GetResistance(SPELL_SCHOOL_HOLY), GetResistance(SPELL_SCHOOL_FIRE));
     TC_LOG_DEBUG("entities.unit", "NatureRes is: \t\t%u\t\tFrostRes is: \t\t%u", GetResistance(SPELL_SCHOOL_NATURE), GetResistance(SPELL_SCHOOL_FROST));
     TC_LOG_DEBUG("entities.unit", "ShadowRes is: \t\t%u\t\tArcaneRes is: \t\t%u", GetResistance(SPELL_SCHOOL_SHADOW), GetResistance(SPELL_SCHOOL_ARCANE));
@@ -20297,7 +20794,12 @@ void Player::SendAttackSwingCantAttack()
 
 void Player::SendAttackSwingCancelAttack()
 {
-    WorldPacket data(SMSG_CANCEL_COMBAT, 0);
+    ObjectGuid guid = GetGUID();
+
+    WorldPacket data(SMSG_CANCEL_COMBAT, 8);
+    data << uint32(0); // Unk
+    data << uint32(0); // Unk
+
     GetSession()->SendPacket(&data);
 }
 
@@ -20324,21 +20826,15 @@ void Player::SendExplorationExperience(uint32 Area, uint32 Experience)
 
 void Player::SendDungeonDifficulty(bool IsInGroup)
 {
-    uint8 val = 0x00000001;
-    WorldPacket data(MSG_SET_DUNGEON_DIFFICULTY, 12);
-    data << (uint32)GetDungeonDifficulty();
-    data << uint32(val);
-    data << uint32(IsInGroup);
+    WorldPacket data(SMSG_SET_DUNGEON_DIFFICULTY, 4);
+    data << uint32(GetDungeonDifficulty());
     GetSession()->SendPacket(&data);
 }
 
 void Player::SendRaidDifficulty(bool IsInGroup, int32 forcedDifficulty)
 {
-    uint8 val = 0x00000001;
-    WorldPacket data(MSG_SET_RAID_DIFFICULTY, 12);
+    WorldPacket data(MSG_SET_RAID_DIFFICULTY, 4);
     data << uint32(forcedDifficulty == -1 ? GetRaidDifficulty() : forcedDifficulty);
-    data << uint32(val);
-    data << uint32(IsInGroup);
     GetSession()->SendPacket(&data);
 }
 
@@ -20606,80 +21102,13 @@ void Player::StopCastingCharm()
     }
 }
 
-inline void Player::BuildPlayerChat(WorldPacket* data, uint8 msgtype, const std::string& text, uint32 language, const char* addonPrefix /*= NULL*/) const
-{
-    ObjectGuid guid(GetGUID());
-
-    data->WriteBit(1);
-    data->WriteBit(0);                          // !hasText
-    data->WriteBit(1);
-    data->WriteBits(0, 8);                      // skip GUID
-    data->WriteBit(1);
-    data->WriteBit(1);                          // !realmId
-    data->WriteBit(1);
-    data->WriteBit(0);
-    data->WriteBit(0);                          // !hasLanguage
-    data->WriteBit(1);
-    data->WriteBits(0, 8);                      // skip GUID
-    data->WriteBits(text.size(), 12);
-    data->WriteBit(0);
-    data->WriteBit(1);
-
-    data->WriteBit(guid[4]); // 28
-    data->WriteBit(guid[2]); // 26
-    data->WriteBit(guid[7]); // 31
-    data->WriteBit(guid[5]); // 29
-    data->WriteBit(guid[1]); // 25
-    data->WriteBit(guid[3]); // 27
-    data->WriteBit(guid[0]); // 24
-    data->WriteBit(guid[6]); // 30
-
-    data->WriteBit(1);
-    data->WriteBit(1);
-    data->WriteBit(0);
-    data->WriteBit(1);
-    data->WriteBit(0);
-
-    data->WriteBit(guid[1]); // 41
-    data->WriteBit(guid[5]); // 45
-    data->WriteBit(guid[4]); // 44
-    data->WriteBit(guid[6]); // 46
-    data->WriteBit(guid[3]); // 43
-    data->WriteBit(guid[2]); // 42
-    data->WriteBit(guid[7]); // 47
-    data->WriteBit(guid[0]); // 40
-    data->FlushBits();
-
-    data->WriteByteSeq(guid[2]);
-    data->WriteByteSeq(guid[7]);
-    data->WriteByteSeq(guid[5]);
-    data->WriteByteSeq(guid[0]);
-    data->WriteByteSeq(guid[3]);
-    data->WriteByteSeq(guid[4]);
-    data->WriteByteSeq(guid[1]);
-    data->WriteByteSeq(guid[6]);
-
-    data->WriteByteSeq(guid[5]);
-    data->WriteByteSeq(guid[7]);
-    data->WriteByteSeq(guid[3]);
-    data->WriteByteSeq(guid[1]);
-    data->WriteByteSeq(guid[6]);
-    data->WriteByteSeq(guid[2]);
-    data->WriteByteSeq(guid[4]);
-    data->WriteByteSeq(guid[0]);
-
-    *data << uint8(language);
-    data->WriteString(text);
-    *data << uint8(msgtype);
-}
-
 void Player::Say(const std::string& text, const uint32 language)
 {
     std::string _text(text);
     sScriptMgr->OnPlayerChat(this, CHAT_MSG_SAY, language, _text);
 
-    WorldPacket data(SMSG_MESSAGECHAT, 200);
-    BuildPlayerChat(&data, CHAT_MSG_SAY, _text, language);
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_SAY, Language(language), this, this, text);
     SendMessageToSetInRange(&data, sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_SAY), true);
 }
 
@@ -20688,8 +21117,8 @@ void Player::Yell(const std::string& text, const uint32 language)
     std::string _text(text);
     sScriptMgr->OnPlayerChat(this, CHAT_MSG_YELL, language, _text);
 
-    WorldPacket data(SMSG_MESSAGECHAT, 200);
-    BuildPlayerChat(&data, CHAT_MSG_YELL, _text, language);
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_YELL, Language(language), this, this, text);
     SendMessageToSetInRange(&data, sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_YELL), true);
 }
 
@@ -20698,8 +21127,8 @@ void Player::TextEmote(const std::string& text)
     std::string _text(text);
     sScriptMgr->OnPlayerChat(this, CHAT_MSG_EMOTE, LANG_UNIVERSAL, _text);
 
-    WorldPacket data(SMSG_MESSAGECHAT, 200);
-    BuildPlayerChat(&data, CHAT_MSG_EMOTE, _text, LANG_UNIVERSAL);
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_EMOTE, LANG_UNIVERSAL, this, this, text);
     SendMessageToSetInRange(&data, sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_TEXTEMOTE), true, !GetSession()->HasPermission(rbac::RBAC_PERM_TWO_SIDE_INTERACTION_CHAT));
 }
 
@@ -20711,8 +21140,8 @@ void Player::WhisperAddon(const std::string& text, const std::string& prefix, Pl
     if (!receiver->GetSession()->IsAddonRegistered(prefix))
         return;
 
-    WorldPacket data(SMSG_MESSAGECHAT, 200);
-    BuildPlayerChat(&data, CHAT_MSG_WHISPER, _text, LANG_UNIVERSAL, prefix.c_str());
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON, this, this, text, 0, "", DEFAULT_LOCALE, prefix);
     receiver->GetSession()->SendPacket(&data);
 }
 
@@ -20728,16 +21157,15 @@ void Player::Whisper(const std::string& text, uint32 language, uint64 receiver)
     std::string _text(text);
     sScriptMgr->OnPlayerChat(this, CHAT_MSG_WHISPER, language, _text, rPlayer);
 
-    WorldPacket data(SMSG_MESSAGECHAT, 200);
-    BuildPlayerChat(&data, CHAT_MSG_WHISPER, _text, language);
+    WorldPacket data;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, Language(language), this, this, text);
     rPlayer->GetSession()->SendPacket(&data);
 
     // rest stuff shouldn't happen in case of addon message
     if (isAddonMessage)
         return;
 
-    data.Initialize(SMSG_MESSAGECHAT, 200);
-    rPlayer->BuildPlayerChat(&data, CHAT_MSG_WHISPER_INFORM, _text, language);
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER_INFORM, Language(language), rPlayer, rPlayer, text);
     GetSession()->SendPacket(&data);
 
     if (!isAcceptWhispers() && !IsGameMaster() && !rPlayer->IsGameMaster())
@@ -21613,11 +22041,24 @@ void Player::ContinueTaxiFlight()
 
 void Player::ProhibitSpellSchool(SpellSchoolMask idSchoolMask, uint32 unTimeMs)
 {
-                                                            // last check 2.0.10
-    WorldPacket data(SMSG_SPELL_COOLDOWN, 8+1+m_spells.size()*8);
-    data << uint64(GetGUID());
-    data << uint8(0x0);                                     // flags (0x1, 0x2)
     time_t curTime = time(NULL);
+    ObjectGuid guid = GetGUID();
+    uint32 count = 0;
+
+    WorldPacket data(SMSG_SPELL_COOLDOWN, 9 + 3 + m_spells.size() * 8);
+    data.WriteBit(guid[0]);
+    data.WriteBit(guid[6]);
+    data.WriteBit(1); // Missing flags
+    data.WriteBit(guid[7]);
+    data.WriteBit(guid[3]);
+    data.WriteBit(guid[1]);
+    data.WriteBit(guid[5]);
+    size_t bitpos = data.bitwpos();
+    data.WriteBits(0, 21);
+    data.WriteBit(guid[2]);
+    data.WriteBit(guid[4]);
+    data.FlushBits();
+
     for (PlayerSpellMap::const_iterator itr = m_spells.begin(); itr != m_spells.end(); ++itr)
     {
         if (itr->second->state == PLAYERSPELL_REMOVED)
@@ -21642,8 +22083,20 @@ void Player::ProhibitSpellSchool(SpellSchoolMask idSchoolMask, uint32 unTimeMs)
             data << uint32(unSpellId);
             data << uint32(unTimeMs);                       // in m.secs
             AddSpellCooldown(unSpellId, 0, curTime + unTimeMs/IN_MILLISECONDS);
+            count++;
         }
     }
+
+    data.PutBits(bitpos, count, 21);
+    data.WriteByteSeq(guid[5]);
+    data.WriteByteSeq(guid[3]);
+    data.WriteByteSeq(guid[7]);
+    data.WriteByteSeq(guid[4]);
+    data.WriteByteSeq(guid[1]);
+    data.WriteByteSeq(guid[0]);
+    data.WriteByteSeq(guid[2]);
+    data.WriteByteSeq(guid[6]);
+
     GetSession()->SendPacket(&data);
 }
 
@@ -21674,6 +22127,12 @@ void Player::InitDataForForm(bool reapplyMods)
         {
             if (getPowerType() != POWER_RAGE)
                 setPowerType(POWER_RAGE);
+            break;
+        }
+        case FORM_WISE_SERPENT:
+        {
+            if (getPowerType() != POWER_MANA)
+            setPowerType(POWER_MANA);
             break;
         }
         default:                                            // 0, for example
@@ -21760,12 +22219,30 @@ inline bool Player::_StoreOrEquipNewItem(uint32 vendorslot, uint32 item, uint8 c
     if (it)
     {
         uint32 new_count = pVendor->UpdateVendorItemCurrentCount(crItem, count);
+        ObjectGuid vGuid = pVendor->GetGUID();
 
-        WorldPacket data(SMSG_BUY_ITEM, (8+4+4+4));
-        data << uint64(pVendor->GetGUID());
-        data << uint32(vendorslot + 1);                   // numbered from 1 at client
-        data << int32(crItem->maxcount > 0 ? new_count : 0xFFFFFFFF);
+        WorldPacket data(SMSG_BUY_ITEM, 1 + 8 + 4 + 4 + 4);
+        data.WriteBit(vGuid[3]);
+        data.WriteBit(vGuid[4]);
+        data.WriteBit(vGuid[7]);
+        data.WriteBit(vGuid[6]);
+        data.WriteBit(vGuid[0]);
+        data.WriteBit(vGuid[2]);
+        data.WriteBit(vGuid[1]);
+        data.WriteBit(vGuid[5]);
+
+        data.WriteByteSeq(vGuid[6]);
+        data.WriteByteSeq(vGuid[7]);
         data << uint32(count);
+        data.WriteByteSeq(vGuid[1]);
+        data.WriteByteSeq(vGuid[3]);
+        data.WriteByteSeq(vGuid[5]);
+        data.WriteByteSeq(vGuid[2]);
+        data << int32(crItem->maxcount > 0 ? new_count : 0xFFFFFFFF);
+        data.WriteByteSeq(vGuid[0]);
+        data.WriteByteSeq(vGuid[4]);
+        data << uint32(vendorslot + 1);                   // numbered from 1 at client
+
         GetSession()->SendPacket(&data);
         SendNewItem(it, count, true, false, false);
 
@@ -21960,7 +22437,7 @@ bool Player::BuyItemFromVendorSlot(uint64 vendorguid, uint32 vendorslot, uint32 
     ItemTemplate const* pProto = sObjectMgr->GetItemTemplate(item);
     if (!pProto)
     {
-        SendBuyError(BUY_ERR_CANT_FIND_ITEM, NULL, item, 0);
+        SendEquipError(EQUIP_ERR_ITEM_NOT_FOUND, NULL, NULL, 0);
         return false;
     }
 
@@ -21968,20 +22445,20 @@ bool Player::BuyItemFromVendorSlot(uint64 vendorguid, uint32 vendorslot, uint32 
     if (!creature)
     {
         TC_LOG_DEBUG("network", "WORLD: BuyItemFromVendor - Unit (GUID: %u) not found or you can't interact with him.", uint32(GUID_LOPART(vendorguid)));
-        SendBuyError(BUY_ERR_DISTANCE_TOO_FAR, NULL, item, 0);
+        SendEquipError(EQUIP_ERR_OUT_OF_RANGE, NULL, NULL, 0);
         return false;
     }
 
     VendorItemData const* vItems = creature->GetVendorItems();
     if (!vItems || vItems->Empty())
     {
-        SendBuyError(BUY_ERR_CANT_FIND_ITEM, creature, item, 0);
+        SendEquipError(EQUIP_ERR_ITEM_NOT_FOUND, NULL, NULL, 0);
         return false;
     }
 
     if (vendorslot >= vItems->GetItemCount())
     {
-        SendBuyError(BUY_ERR_CANT_FIND_ITEM, creature, item, 0);
+        SendEquipError(EQUIP_ERR_ITEM_NOT_FOUND, NULL, NULL, 0);
         return false;
     }
 
@@ -21989,7 +22466,7 @@ bool Player::BuyItemFromVendorSlot(uint64 vendorguid, uint32 vendorslot, uint32 
     // store diff item (cheating)
     if (!crItem || crItem->item != item)
     {
-        SendBuyError(BUY_ERR_CANT_FIND_ITEM, creature, item, 0);
+        SendEquipError(EQUIP_ERR_ITEM_NOT_FOUND, NULL, NULL, 0);
         return false;
     }
 
@@ -21998,14 +22475,14 @@ bool Player::BuyItemFromVendorSlot(uint64 vendorguid, uint32 vendorslot, uint32 
     {
         if (creature->GetVendorItemCurrentCount(crItem) < pProto->BuyCount * count)
         {
-            SendBuyError(BUY_ERR_ITEM_ALREADY_SOLD, creature, item, 0);
+            SendEquipError(EQUIP_ERR_VENDOR_SOLD_OUT, NULL, NULL, 0);
             return false;
         }
     }
 
     if (pProto->RequiredReputationFaction && (uint32(GetReputationRank(pProto->RequiredReputationFaction)) < pProto->RequiredReputationRank))
     {
-        SendBuyError(BUY_ERR_REPUTATION_REQUIRE, creature, item, 0);
+        SendEquipError(EQUIP_ERR_CANT_EQUIP_REPUTATION, NULL, NULL, 0);
         return false;
     }
 
@@ -22043,7 +22520,7 @@ bool Player::BuyItemFromVendorSlot(uint64 vendorguid, uint32 vendorslot, uint32 
             CurrencyTypesEntry const* entry = sCurrencyTypesStore.LookupEntry(iece->RequiredCurrency[i]);
             if (!entry)
             {
-                SendBuyError(BUY_ERR_CANT_FIND_ITEM, creature, item, 0);
+                SendEquipError(EQUIP_ERR_ITEM_NOT_FOUND, NULL, NULL, 0);
                 return false;
             }
 
@@ -22069,7 +22546,8 @@ bool Player::BuyItemFromVendorSlot(uint64 vendorguid, uint32 vendorslot, uint32 
 
         if (iece->RequiredFactionId && uint32(GetReputationRank(iece->RequiredFactionId)) < iece->RequiredFactionStanding)
         {
-            SendBuyError(BUY_ERR_REPUTATION_REQUIRE, creature, item, 0);
+            SendEquipError(EQUIP_ERR_CANT_EQUIP_REPUTATION, NULL, NULL, 0);
+
             return false;
         }
 
@@ -22111,7 +22589,7 @@ bool Player::BuyItemFromVendorSlot(uint64 vendorguid, uint32 vendorslot, uint32 
 
         if (!HasEnoughMoney(uint64(price)))
         {
-            SendBuyError(BUY_ERR_NOT_ENOUGHT_MONEY, creature, item, 0);
+            SendEquipError(EQUIP_ERR_NOT_ENOUGH_MONEY, NULL, NULL, 0);
             return false;
         }
     }
@@ -22435,9 +22913,27 @@ void Player::SendCooldownEvent(SpellInfo const* spellInfo, uint32 itemId /*= 0*/
         AddSpellAndCategoryCooldowns(spellInfo, itemId, spell);
 
     // Send activate cooldown timer (possible 0) at client side
+    ObjectGuid guid = GetGUID();
+
     WorldPacket data(SMSG_COOLDOWN_EVENT, 4 + 8);
+    data.WriteBit(guid[4]);
+    data.WriteBit(guid[7]);
+    data.WriteBit(guid[1]);
+    data.WriteBit(guid[6]);
+    data.WriteBit(guid[5]);
+    data.WriteBit(guid[3]);
+    data.WriteBit(guid[0]);
+    data.WriteBit(guid[2]);
+
+    data.WriteByteSeq(guid[0]);
+    data.WriteByteSeq(guid[5]);
+    data.WriteByteSeq(guid[1]);
+    data.WriteByteSeq(guid[4]);
+    data.WriteByteSeq(guid[3]);
+    data.WriteByteSeq(guid[2]);
+    data.WriteByteSeq(guid[6]);
     data << uint32(spellInfo->Id);
-    data << uint64(GetGUID());
+    data.WriteByteSeq(guid[7]);
     SendDirectMessage(&data);
 }
 
@@ -23093,8 +23589,29 @@ void Player::SendComboPoints()
         }
         else
             data.Initialize(SMSG_UPDATE_COMBO_POINTS, combotarget->GetPackGUID().size()+1);
-        data.append(combotarget->GetPackGUID());
+
+        ObjectGuid guid = combotarget->GetGUID();
+        data.WriteBit(guid[0]);
+        data.WriteBit(guid[5]);
+        data.WriteBit(guid[6]);
+        data.WriteBit(guid[3]);
+        data.WriteBit(guid[7]);
+        data.WriteBit(guid[4]);
+        data.WriteBit(guid[1]);
+        data.WriteBit(guid[2]);
+
+        data.FlushBits();
+
+        data.WriteByteSeq(guid[5]);
+        data.WriteByteSeq(guid[6]);
+        data.WriteByteSeq(guid[4]);
+        data.WriteByteSeq(guid[7]);
+        data.WriteByteSeq(guid[3]);
+        data.WriteByteSeq(guid[0]);
         data << uint8(m_comboPoints);
+        data.WriteByteSeq(guid[2]);
+        data.WriteByteSeq(guid[1]);
+
         GetSession()->SendPacket(&data);
     }
 }
@@ -23189,12 +23706,13 @@ void Player::SendInitialPacketsBeforeAddToMap()
     // guild bank list wtf?
 
     // Homebind
-    WorldPacket data(SMSG_BINDPOINTUPDATE, 5*4);
-    data << m_homebindZ;
+    WorldPacket data(SMSG_BINDPOINTUPDATE, 4 + 4 + 4 + 4 + 4);
     data << m_homebindX;
-    data << (uint32) m_homebindMapId;
+    data << m_homebindZ;
     data << m_homebindY;
     data << (uint32) m_homebindAreaId;
+    data << (uint32) m_homebindMapId;
+
     GetSession()->SendPacket(&data);
 
     // SMSG_SET_PROFICIENCY
@@ -23204,28 +23722,33 @@ void Player::SendInitialPacketsBeforeAddToMap()
 
     SendTalentsInfoData();
 
-    data.Initialize(SMSG_WORLD_SERVER_INFO, 1 + 1 + 4 + 4);
+    data.Initialize(SMSG_WORLD_SERVER_INFO, 4 + 4 + 1 + 1);
+    // Bitfields have wrong order
+    data.WriteBit(0);                                               // IneligibleForLoot
     data.WriteBit(0);                                               // HasRestrictedLevel
     data.WriteBit(0);                                               // HasRestrictedMoney
-    data.WriteBit(0);                                               // IneligibleForLoot
+    data.WriteBit(0);                                               // HasGroupSize
     data.FlushBits();
-    //if (IneligibleForLoot)
-    //    data << uint32(0);                                        // EncounterMask
 
     data << uint8(0);                                               // IsOnTournamentRealm
-    //if (HasRestrictedMoney)
-    //    data << uint32(100000);                                   // RestrictedMoney (starter accounts)
-    //if (HasRestrictedLevel)
-    //    data << uint32(20);                                       // RestrictedLevel (starter accounts)
-
     data << uint32(sWorld->GetNextWeeklyQuestsResetTime() - WEEK);  // LastWeeklyReset (not instance reset)
     data << uint32(GetMap()->GetDifficulty());
+
+    //if (HasGroupSize)
+    //    data << uint32(0);
+    //if (HasRestrictedLevel)
+    //    data << uint32(20);                                       // RestrictedLevel (starter accounts)
+    //if (IneligibleForLoot)
+    //    data << uint32(0);                                        // EncounterMask
+    //if (HasRestrictedMoney)
+    //    data << uint32(100000);                                   // RestrictedMoney (starter accounts)
     GetSession()->SendPacket(&data);
 
     SendInitialSpells();
 
     data.Initialize(SMSG_SEND_UNLEARN_SPELLS, 4);
-    data << uint32(0);                                      // count, for (count) uint32;
+    data.WriteBits(0, 22); // Count
+    data.FlushBits();
     GetSession()->SendPacket(&data);
 
     SendInitialActionButtons();
@@ -23235,13 +23758,11 @@ void Player::SendInitialPacketsBeforeAddToMap()
     SendEquipmentSetList();
 
     data.Initialize(SMSG_LOGIN_SETTIMESPEED, 20);
-    
-    data << uint32(1);
-    data << uint32(1);
+    data << uint32(0);
+    data.AppendPackedTime(sWorld->GetGameTime());
+    data << uint32(0);
+    data.AppendPackedTime(sWorld->GetGameTime());
     data << float(0.01666667f);                             // game speed
-    data.AppendPackedTime(sWorld->GetGameTime());
-    data.AppendPackedTime(sWorld->GetGameTime());
-
     GetSession()->SendPacket(&data);
 
     GetReputationMgr().SendForceReactions();                // SMSG_SET_FORCED_REACTIONS
@@ -23309,6 +23830,9 @@ void Player::SendInitialPacketsAfterAddToMap()
     }
     else if (GetRaidDifficulty() != GetStoredRaidDifficulty())
         SendRaidDifficulty(GetGroup() != NULL);
+
+    m_battlePetMgr->SendBattlePetJournal();
+    m_battlePetMgr->SendBattlePetJournalLock();
 }
 
 void Player::SendUpdateToOutOfRangeGroupMembers()
@@ -23604,15 +24128,16 @@ void Player::SendAurasForTarget(Unit* target)
     Unit::VisibleAuraMap const* visibleAuras = target->GetVisibleAuras();
 
     WorldPacket data(SMSG_AURA_UPDATE);
-    data.WriteBit(targetGuid[3]);
-    data.WriteBit(targetGuid[6]);
-    data.WriteBit(targetGuid[0]);
     data.WriteBit(targetGuid[7]);
-    data.WriteBit(targetGuid[5]);
+    data.WriteBit(1);                                   // Is AURA_UPDATE_ALL
+    data.WriteBits(visibleAuras->size(), 24);           // Aura Count
+    data.WriteBit(targetGuid[6]);
+    data.WriteBit(targetGuid[1]);
+    data.WriteBit(targetGuid[3]);
+    data.WriteBit(targetGuid[0]);
     data.WriteBit(targetGuid[4]);
-    data.WriteBits(1, 24);                              // Aura Count
-    data.WriteBit(0);                                   // Is AURA_UPDATE_ALL
-    data.WriteBit(!remove);                             // HasData
+    data.WriteBit(targetGuid[2]);
+    data.WriteBit(targetGuid[5]);
 
     for (Unit::VisibleAuraMap::const_iterator itr = visibleAuras->begin(); itr != visibleAuras->end(); ++itr)
     {
@@ -23621,6 +24146,8 @@ void Player::SendAurasForTarget(Unit* target)
         uint32 flags = auraApp->GetFlags();
         if (aura->GetMaxDuration() > 0 && !(aura->GetSpellInfo()->AttributesEx5 & SPELL_ATTR5_HIDE_DURATION))
             flags |= AFLAG_DURATION;
+
+        data.WriteBit(1);                               // Not remove
 
         if (flags & AFLAG_ANY_EFFECT_AMOUNT_SENT)
         {
@@ -23634,28 +24161,26 @@ void Player::SendAurasForTarget(Unit* target)
         else
             data.WriteBits(0, 22);                      // Effect Count
 
-        data.WriteBits(0, 22);                          // Unk effect count
         data.WriteBit(!(flags & AFLAG_CASTER));         // HasCasterGuid
 
         if (!(flags & AFLAG_CASTER))
         {
             ObjectGuid casterGuid = aura->GetCasterGUID();
-            data.WriteBit(casterGuid[7]);
+            data.WriteBit(casterGuid[3]);
             data.WriteBit(casterGuid[4]);
-            data.WriteBit(casterGuid[2]);
-            data.WriteBit(casterGuid[5]);
             data.WriteBit(casterGuid[6]);
             data.WriteBit(casterGuid[1]);
-            data.WriteBit(casterGuid[3]);
+            data.WriteBit(casterGuid[5]);
+            data.WriteBit(casterGuid[2]);
             data.WriteBit(casterGuid[0]);
+            data.WriteBit(casterGuid[7]);
         }
 
-        data.WriteBit(flags & AFLAG_DURATION);          // HasMaxDuration
+        data.WriteBits(0, 22);                          // Unk effect count
         data.WriteBit(flags & AFLAG_DURATION);          // HasDuration
+        data.WriteBit(flags & AFLAG_DURATION);          // HasMaxDuration
     }
 
-    data.WriteBit(targetGuid[1]);
-    data.WriteBit(targetGuid[2]);
     data.FlushBits();
 
     for (Unit::VisibleAuraMap::const_iterator itr = visibleAuras->begin(); itr != visibleAuras->end(); ++itr)
@@ -23669,18 +24194,30 @@ void Player::SendAurasForTarget(Unit* target)
         if (!(flags & AFLAG_CASTER))
         {
             ObjectGuid casterGuid = aura->GetCasterGUID();
-            data.WriteByteSeq(casterGuid[0]);
             data.WriteByteSeq(casterGuid[3]);
-            data.WriteByteSeq(casterGuid[7]);
-            data.WriteByteSeq(casterGuid[1]);
             data.WriteByteSeq(casterGuid[2]);
-            data.WriteByteSeq(casterGuid[5]);
-            data.WriteByteSeq(casterGuid[4]);
+            data.WriteByteSeq(casterGuid[1]);
             data.WriteByteSeq(casterGuid[6]);
+            data.WriteByteSeq(casterGuid[4]);
+            data.WriteByteSeq(casterGuid[0]);
+            data.WriteByteSeq(casterGuid[5]);
+            data.WriteByteSeq(casterGuid[7]);
         }
+
+        data << uint8(flags);
+        data << uint16(aura->GetCasterLevel());
+        data << uint32(aura->GetId());
+
+        if (flags & AFLAG_DURATION)
+            data << uint32(aura->GetMaxDuration());
 
         if (flags & AFLAG_DURATION)
             data << uint32(aura->GetDuration());
+
+        // send stack amount for aura which could be stacked (never 0 - causes incorrect display) or charges
+        // stack amount has priority over charges (checked on retail with spell 50262)
+        data << uint8(aura->GetSpellInfo()->StackAmount ? aura->GetStackAmount() : aura->GetCharges());
+        data << uint32(auraApp->GetEffectMask());
 
         if (flags & AFLAG_ANY_EFFECT_AMOUNT_SENT)
         {
@@ -23696,29 +24233,17 @@ void Player::SendAurasForTarget(Unit* target)
             }
         }
 
-        data << uint16(aura->GetCasterLevel());
-
-        if (flags & AFLAG_DURATION)
-            data << uint32(aura->GetMaxDuration());
-
-        // send stack amount for aura which could be stacked (never 0 - causes incorrect display) or charges
-        // stack amount has priority over charges (checked on retail with spell 50262)
-        data << uint8(aura->GetSpellInfo()->StackAmount ? aura->GetStackAmount() : aura->GetCharges());
-
-        data << uint32(aura->GetId());
-        data << uint8(flags);
-        data << uint32(auraApp->GetEffectMask());
         data << uint8(auraApp->GetSlot());
     }
 
-    data.WriteByteSeq(targetGuid[5]);
-    data.WriteByteSeq(targetGuid[1]);
     data.WriteByteSeq(targetGuid[2]);
     data.WriteByteSeq(targetGuid[6]);
-    data.WriteByteSeq(targetGuid[0]);
     data.WriteByteSeq(targetGuid[7]);
-    data.WriteByteSeq(targetGuid[4]);
+    data.WriteByteSeq(targetGuid[1]);
     data.WriteByteSeq(targetGuid[3]);
+    data.WriteByteSeq(targetGuid[4]);
+    data.WriteByteSeq(targetGuid[0]);
+    data.WriteByteSeq(targetGuid[5]);
 
     GetSession()->SendPacket(&data);
 }
@@ -24458,10 +24983,29 @@ void Player::ResurectUsingRequestData()
 
 void Player::SetClientControl(Unit* target, uint8 allowMove)
 {
-    WorldPacket data(SMSG_CLIENT_CONTROL_UPDATE, target->GetPackGUID().size()+1);
-    data.append(target->GetPackGUID());
-    data << uint8(allowMove);
+    ObjectGuid guid = target->GetGUID();
+
+    WorldPacket data(SMSG_CLIENT_CONTROL_UPDATE, 9 + 1);
+    data.WriteBit(guid[2]);
+    data.WriteBit(guid[7]);
+    data.WriteBit(allowMove);
+    data.WriteBit(guid[0]);
+    data.WriteBit(guid[3]);
+    data.WriteBit(guid[6]);
+    data.WriteBit(guid[5]);
+    data.WriteBit(guid[1]);
+    data.WriteBit(guid[4]);
+
+    data.WriteByteSeq(guid[1]);
+    data.WriteByteSeq(guid[5]);
+    data.WriteByteSeq(guid[7]);
+    data.WriteByteSeq(guid[4]);
+    data.WriteByteSeq(guid[2]);
+    data.WriteByteSeq(guid[6]);
+    data.WriteByteSeq(guid[3]);
+    data.WriteByteSeq(guid[0]);
     GetSession()->SendPacket(&data);
+
     if (target == this && allowMove == 1)
         SetMover(this);
 }
@@ -24476,22 +25020,22 @@ void Player::SetMover(Unit* target)
 
     WorldPacket data(SMSG_MOVE_SET_ACTIVE_MOVER, 9);
     data.WriteBit(guid[5]);
-    data.WriteBit(guid[7]);
-    data.WriteBit(guid[3]);
-    data.WriteBit(guid[6]);
-    data.WriteBit(guid[0]);
-    data.WriteBit(guid[4]);
     data.WriteBit(guid[1]);
+    data.WriteBit(guid[4]);
     data.WriteBit(guid[2]);
+    data.WriteBit(guid[3]);
+    data.WriteBit(guid[7]);
+    data.WriteBit(guid[0]);
+    data.WriteBit(guid[6]);
 
+    data.WriteByteSeq(guid[4]);
     data.WriteByteSeq(guid[6]);
     data.WriteByteSeq(guid[2]);
-    data.WriteByteSeq(guid[3]);
     data.WriteByteSeq(guid[0]);
-    data.WriteByteSeq(guid[5]);
+    data.WriteByteSeq(guid[3]);
     data.WriteByteSeq(guid[7]);
+    data.WriteByteSeq(guid[5]);
     data.WriteByteSeq(guid[1]);
-    data.WriteByteSeq(guid[4]);
 
     SendDirectMessage(&data);
 }
@@ -24622,7 +25166,11 @@ void Player::SendCorpseReclaimDelay(bool load)
 
     //! corpse reclaim delay 30 * 1000ms or longer at often deaths
     WorldPacket data(SMSG_CORPSE_RECLAIM_DELAY, 4);
-    data << uint32(delay*IN_MILLISECONDS);
+    data.WriteBit(delay == 0);
+
+    if (delay)
+        data << uint32(delay * IN_MILLISECONDS);
+
     GetSession()->SendPacket(&data);
 }
 
@@ -24982,9 +25530,11 @@ void Player::InitGlyphsForLevel()
     uint32 slotMask = 0;
 
     if (level >= 25)
-        slotMask |= 0x01 | 0x02 | 0x40;
+        slotMask |= 0x01 | 0x02;
     if (level >= 50)
-        slotMask |= 0x04 | 0x08 | 0x80;
+        slotMask |= 0x04 | 0x08;
+    if (level >= 75)
+        slotMask |= 0x10 | 0x20;
 
     SetUInt32Value(PLAYER_FIELD_GLYPH_SLOTS_ENABLED, slotMask);
 }
@@ -25302,7 +25852,7 @@ void Player::StoreLootItem(uint8 lootSlot, Loot* loot)
             qitem->is_looted = true;
             //freeforall is 1 if everyone's supposed to get the quest item.
             if (item->freeforall || loot->GetPlayerQuestItems().size() == 1)
-                SendNotifyLootItemRemoved(lootSlot);
+                SendNotifyLootItemRemoved(lootSlot, GetLootGUID());
             else
                 loot->NotifyQuestItemRemoved(qitem->index);
         }
@@ -25312,7 +25862,7 @@ void Player::StoreLootItem(uint8 lootSlot, Loot* loot)
             {
                 //freeforall case, notify only one player of the removal
                 ffaitem->is_looted = true;
-                SendNotifyLootItemRemoved(lootSlot);
+                SendNotifyLootItemRemoved(lootSlot, GetLootGUID());
             }
             else
             {
@@ -25677,7 +26227,7 @@ bool Player::LearnTalent(uint16 talentId)
 
     if (!talentInfo)
         return false;
-        
+
     uint32 maxTalentRow = GetUInt32Value(PLAYER_FIELD_MAX_TALENT_TIERS);
 
     // prevent learn talent for different class (cheating)
@@ -25889,6 +26439,8 @@ bool Player::CanSeeSpellClickOn(Creature const* c) const
 void Player::BuildPlayerTalentsInfoData(WorldPacket* data)
 {
     size_t* wpos = new size_t[GetSpecsCount()];
+
+    *data << uint8(GetActiveSpec());                        // talent group index (0 or 1)
     data->WriteBits(GetSpecsCount(), 19);
 
     for (int i = 0; i < GetSpecsCount(); i++)
@@ -25896,6 +26448,8 @@ void Player::BuildPlayerTalentsInfoData(WorldPacket* data)
         wpos[i] = data->bitwpos();
         data->WriteBits(0, 23);
     }
+
+    data->FlushBits();
 
     for (int32 i = 0; i < GetSpecsCount(); i++)
     {
@@ -25926,7 +26480,6 @@ void Player::BuildPlayerTalentsInfoData(WorldPacket* data)
         *data << uint32(GetTalentSpecialization(GetActiveSpec()));
     }
 
-    *data << uint8(GetActiveSpec());                        // talent group index (0 or 1)
     delete[] wpos;
 }
 
@@ -25992,7 +26545,7 @@ void Player::BuildPetTalentsInfoData(WorldPacket* data)
 
             *data << uint32(talentInfo->TalentID);          // Talent.dbc
             *data << uint8(curtalent_maxrank);              // talentMaxRank (0-4)
-            
+
             ++talentIdCount;
         }
 
@@ -26237,30 +26790,30 @@ void Player::SendClearAllCooldowns(Unit* target)
     uint32 spellCount = m_spellCooldowns.size();
     ObjectGuid guid = target ? target->GetGUID() : 0;
 
-    WorldPacket data(SMSG_CLEAR_COOLDOWNS, 4+8);
-    data.WriteBit(guid[1]);
-    data.WriteBit(guid[3]);
+    WorldPacket data(SMSG_CLEAR_COOLDOWNS, 4+8+1+spellCount*4);
     data.WriteBit(guid[6]);
-    data.WriteBits(spellCount, 24); // Spell Count
-    data.WriteBit(guid[7]);
-    data.WriteBit(guid[5]);
-    data.WriteBit(guid[2]);
     data.WriteBit(guid[4]);
+    data.WriteBits(spellCount, 22); // Spell Count
+    data.WriteBit(guid[5]);
     data.WriteBit(guid[0]);
+    data.WriteBit(guid[3]);
+    data.WriteBit(guid[2]);
+    data.WriteBit(guid[7]);
+    data.WriteBit(guid[1]);
 
     data.FlushBits();
 
-    data.WriteByteSeq(guid[7]);
-    data.WriteByteSeq(guid[2]);
+    data.WriteByteSeq(guid[3]);
+    data.WriteByteSeq(guid[0]);
+    data.WriteByteSeq(guid[1]);
     data.WriteByteSeq(guid[4]);
     data.WriteByteSeq(guid[5]);
-    data.WriteByteSeq(guid[1]);
-    data.WriteByteSeq(guid[3]);
     for (SpellCooldowns::const_iterator itr = m_spellCooldowns.begin(); itr != m_spellCooldowns.end(); ++itr)
         data << uint32(itr->first); // Spell ID
 
-    data.WriteByteSeq(guid[0]);
     data.WriteByteSeq(guid[6]);
+    data.WriteByteSeq(guid[7]);
+    data.WriteByteSeq(guid[2]);
 
     SendDirectMessage(&data);
 }
@@ -26425,7 +26978,7 @@ void Player::UpdateSpecCount(uint8 count)
 
 void Player::ActivateSpec(uint8 spec)
 {
-    
+
     if (GetActiveSpec() == spec)
         return;
 
@@ -27269,12 +27822,31 @@ bool Player::CanUseMastery() const
     return HasSpell(MasterySpells[getClass()]);
 }
 
+void Player::ReadyCheckComplete()
+{
+    Group* group = GetGroup();
+    if (!group)
+        return;
+
+    if (!group->IsLeader(GetGUID()))
+        return;
+
+    if (!group->ReadyCheckInProgress())
+        return;
+
+    _readyCheckTimer = 0;
+
+    group->ReadyCheck(false);
+    group->ReadyCheckResetResponded();
+    group->SendReadyCheckCompleted();
+}
+
 void Player::ReadMovementInfo(WorldPacket& data, MovementInfo* mi, Movement::ExtraMovementStatusElement* extras /*= NULL*/)
 {
     MovementStatusElements const* sequence = GetMovementStatusElementsSequence(data.GetOpcode());
     if (!sequence)
     {
-        TC_LOG_ERROR("network", "Player::ReadMovementInfo: No movement sequence found for opcode %s", GetOpcodeNameForLogging(data.GetOpcode()).c_str());
+        TC_LOG_ERROR("network", "Player::ReadMovementInfo: No movement sequence found for opcode %s", GetOpcodeNameForLogging(data.GetOpcode(), false).c_str());
         return;
     }
 
@@ -27289,8 +27861,8 @@ void Player::ReadMovementInfo(WorldPacket& data, MovementInfo* mi, Movement::Ext
     bool hasFallData = false;
     bool hasFallDirection = false;
     bool hasSplineElevation = false;
-    bool hasUnkTime = false;
-    uint32 counterCount = 0u;
+    bool hasCounter = false;
+    uint32 forcesCount = 0u;
 
     ObjectGuid guid;
     ObjectGuid tguid;
@@ -27467,18 +28039,18 @@ void Player::ReadMovementInfo(WorldPacket& data, MovementInfo* mi, Movement::Ext
                 if (hasSplineElevation)
                     data >> mi->splineElevation;
                 break;
-            case MSECounterCount:
-                counterCount = data.ReadBits(22);
+            case MSEForcesCount:
+                forcesCount = data.ReadBits(22);
+                break;
+            case MSEForces:
+                for (uint32 i = 0; i < forcesCount; i++)
+                    data.read_skip<uint32>();
+                break;
+            case MSEHasCounter:
+                hasCounter = !data.ReadBit();
                 break;
             case MSECounter:
-                for (int i = 0; i != counterCount; i++)
-                    data.read_skip<uint32>();   /// @TODO: Maybe compare it with m_movementCounter to verify that packets are sent & received in order?
-                break;
-            case MSEHasUnkTime:
-                hasUnkTime = !data.ReadBit();
-                break;
-            case MSEUnkTime:
-                if (hasUnkTime)
+                if (hasCounter)
                     data.read_skip<uint32>();
                 break;
             case MSEZeroBit:

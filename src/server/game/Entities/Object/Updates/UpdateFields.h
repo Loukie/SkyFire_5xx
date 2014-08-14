@@ -20,7 +20,7 @@
 #ifndef _UPDATEFIELDS_H
 #define _UPDATEFIELDS_H
 
-// Auto generated for version 5, 4, 1, 17538
+// Auto generated for version 5.4.7 18019
 
 enum EObjectFields
 {
@@ -51,6 +51,12 @@ enum EItemFields
     ITEM_FIELD_CREATE_PLAYED_TIME                            = OBJECT_END + 0x3B, // Size: 1, Flags: UF_FLAG_PUBLIC
     ITEM_FIELD_MODIFIERS_MASK                                = OBJECT_END + 0x3C, // Size: 1, Flags: UF_FLAG_OWNER
     ITEM_END                                                 = OBJECT_END + 0x3D,
+};
+
+enum ItemDynamicFields
+{
+    ITEM_DYNAMIC_MODIFIERS = 0x0,
+    ITEM_DYNAMIC_END = 0x1
 };
 
 enum EContainerFields

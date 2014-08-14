@@ -741,38 +741,41 @@ struct ChrClassesEntry
 
 struct ChrRacesEntry
 {
-    uint32      RaceID;                                     // 0
-                                                            // 1 unused
-    uint32      FactionID;                                  // 2 facton template id
-                                                            // 3 unused
-    uint32      model_m;                                    // 4
-    uint32      model_f;                                    // 5
-                                                            // 6 unused
-    uint32      TeamID;                                     // 7 (7-Alliance 1-Horde)
-                                                            // 8-11 unused
-    uint32      CinematicSequence;                          // 12 id from CinematicSequences.dbc
-    //uint32    unk_322;                                    // 13       m_alliance (0 alliance, 1 horde, 2 not available?)
-    char* name;                                             // 14       m_name_lang used for DBC language detection/selection
-    //char*       nameFemale;                               // 15       m_name_female_lang
-    //char*       nameNeutralGender;                        // 16       m_name_male_lang
-                                                            // 17-18    m_facialHairCustomization[2]
-                                                            // 19       m_hairCustomization
-    uint32      expansion;                                  // 20       m_required_expansion
-    //uint32                                                // 21 (23 for worgens)
-    //uint32                                                // 22 4.0.0
-    //uint32                                                // 23 4.0.0
-    //uint32 unk1                                           // 24 - Pandaria
-    //uint32 defaultClassForRace                            // 25 - Pandaria
-    //float unk3                                            // 26 - Pandaria
-    //float unk4                                            // 27 - Pandaria
-    //float unk5                                            // 28 - Pandaria
-    //uint32 unk6                                           // 29 - Pandaria
-    //float unk7                                            // 30 - Pandaria
-    //float unk8                                            // 31 - Pandaria
-    //uint32 unk9                                           // 32 - Pandaria
-    //float unk10                                           // 33 - Pandaria
-    //uint32 unk11                                          // 34 - Pandaria
-    //float unk12                                           // 35 - Pandaria
+    uint32 RaceID;                                          // 0
+    //uint32 unk0;                                          // 1
+    uint32 FactionID;                                       // 2 facton template id
+    //uin32 unk1;                                           // 3
+    uint32 model_m;                                         // 4
+    uint32 model_f;                                         // 5
+    //uint32 unk2;                                          // 6
+    uint32 TeamID;                                          // 7 (42-Neutral 7-Alliance 1-Horde)
+    //uint32 unk3;                                          // 8 (All 7)
+    //uint32 unk4;                                          // 9 (All 15007)
+    //uint32 unk5;                                          // 10 (All 1096)
+    //uint32 unk6;                                          // 11
+    uint32 CinematicSequence;                               // 12 id from CinematicSequences.dbc
+    //uint32 m_charType;                                    // 13 (0 alliance, 1 horde, 2 neutral)
+    char* name;                                             // 14 m_name_lang used for DBC language detection/selection
+    //char* nameFemale;                                     // 15 ""
+    //char* nameNeutralGender;                              // 16 ""
+    //uint32 m_facialHairCustomization[2]                   // 17-18
+    //uint32 m_hairCustomization                            // 19
+    //uint32 m_enemyRace;                                   // 20 m_enemyRace
+    //uint32 m_linkedRace;                                  // 21 (23 for worgens = Gilnean)
+    //uint32 unk7;                                          // 22 (Gilnean 3133)
+    //uint32 unk8;                                          // 23 (Gilnean 3134)
+    //uint32 unk9;                                          // 24 (All 1, Pandaren 2)
+    //uint32 defaultClassForRace                            // 25
+    //uint32 unk10;                                         // 26
+    //uint32 unk11;                                         // 27
+    //float unk12;                                          // 28
+    //uint32 unk13;                                         // 29 unused
+    //float unk14;                                          // 30
+    //float unk15;                                          // 31
+    //uint32 unk16;                                         // 32 unused
+    //float unk17;                                          // 33
+    //uint32 unk18;                                         // 34
+    //uint32 unk19;                                         // 35
 };
 
 struct ChrPowerTypesEntry
@@ -1498,7 +1501,7 @@ struct MapEntry
     //char*       internalname;                             // 1 unused
     uint32  map_type;                                       // 2
     //uint32 flags;                                         // 3
-    //uint32 isPvp;                                         // 4  
+    //uint32 isPvp;                                         // 4
     char* name;                                             // 5        m_MapName_lang
     uint32  linked_zone;                                    // 6        m_areaTableID
     //char*     hordeIntro;                                 // 7        m_MapDescription0_lang
@@ -1780,8 +1783,6 @@ struct SpellEffectEntry
 
 #define MAX_SPELL_EFFECTS 32
 #define MAX_EFFECT_MASK 0xFFFFFFFF // Full uint32
-#define MAX_SPELL_REAGENTS 8
-#define MAX_SPELL_REAGENTS2 10
 
 // SpellAuraOptions.dbc
 struct SpellAuraOptionsEntry
@@ -1877,21 +1878,22 @@ struct SpellMiscEntry
     uint32    AttributesEx3;                                // 6        m_attributesExC
     uint32    AttributesEx4;                                // 7        m_attributesExD
     uint32    AttributesEx5;                                // 8        m_attributesExE
-    uint32    AttributesEx6;                                // 9       m_attributesExF
+    uint32    AttributesEx6;                                // 9        m_attributesExF
     uint32    AttributesEx7;                                // 10       m_attributesExG
     uint32    AttributesEx8;                                // 11       m_attributesExH
     uint32    AttributesEx9;                                // 12       m_attributesExI
     uint32    AttributesEx10;                               // 13       m_attributesExJ
     uint32    AttributesEx11;                               // 14       m_attributesExK
     uint32    AttributesEx12;                               // 15       m_attributesExL
-    uint32    CastingTimeIndex;                             // 16       m_castingTimeIndex
-    uint32    DurationIndex;                                // 17       m_durationIndex
-    uint32    rangeIndex;                                   // 18       m_rangeIndex
-    float     speed;                                        // 19       m_speed
-    uint32    SpellVisual[2];                               // 20-21    m_spellVisualID
-    uint32    SpellIconID;                                  // 22       m_spellIconID
-    uint32    activeIconID;                                 // 23       m_activeIconID
-    uint32    SchoolMask;                                   // 24       m_schoolMask
+    uint32    AttributesEx13;                               // 16       m_attributesExM
+    uint32    CastingTimeIndex;                             // 17       m_castingTimeIndex
+    uint32    DurationIndex;                                // 18       m_durationIndex
+    uint32    rangeIndex;                                   // 19       m_rangeIndex
+    float     speed;                                        // 20       m_speed
+    uint32    SpellVisual[2];                               // 21-22    m_spellVisualID
+    uint32    SpellIconID;                                  // 23       m_spellIconID
+    uint32    activeIconID;                                 // 24       m_activeIconID
+    uint32    SchoolMask;                                   // 25       m_schoolMask
 };
 
 // SpellEffectScaling.dbc
@@ -2102,7 +2104,7 @@ struct SpellTargetRestrictionsEntry
     uint32    Id;                                           // 0        m_ID
     //uint32  spellId;                                      // 1  - Pandaria
     //uint32  unk0;                                         // 2  - Pandaria always after spellId
-    //float  unk0;                                          // 3  
+    //float  unk0;                                          // 3
     //uint32  unk0;                                         // 4  - Pandaria always  after spellId
     uint32    MaxAffectedTargets;                           // 5        m_maxTargets
     uint32    MaxTargetLevel;                               // 6        m_maxTargetLevel

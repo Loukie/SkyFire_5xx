@@ -33,6 +33,7 @@
 #include "Cryptography/BigNumber.h"
 #include "Opcodes.h"
 #include "AccountMgr.h"
+#include "Object.h"
 
 class Creature;
 class GameObject;
@@ -129,8 +130,9 @@ enum CharterTypes
     ARENA_TEAM_CHARTER_5v5_TYPE                   = 5,
 };
 
-#define DB2_REPLY_SPARSE 2442913102
-#define DB2_REPLY_ITEM   1344507586
+#define DB2_REPLY_BROADCAST 35137211
+#define DB2_REPLY_SPARSE    2442913102
+#define DB2_REPLY_ITEM      1344507586
 
 //class to deal with packet processing
 //allows to determine if next packet is safe to be processed
@@ -142,7 +144,7 @@ public:
 
     virtual bool Process(WorldPacket* /*packet*/) { return true; }
     virtual bool ProcessLogout() const { return true; }
-    static Opcodes DropHighBytes(Opcodes opcode) { return Opcodes(opcode & 0xFFFF); }
+    static uint16 DropHighBytes(uint16 opcode) { return opcode & NUM_OPCODE_HANDLERS; }
 
 protected:
     WorldSession* const m_pSession;
@@ -214,6 +216,7 @@ class WorldSession
 
         void ReadAddonsInfo(WorldPacket& data);
         void SendAddonsInfo();
+        void SendTimezoneInformation();
         bool IsAddonRegistered(const std::string& prefix) const;
 
         void SendPacket(WorldPacket const* packet, bool forced = false);
@@ -222,8 +225,9 @@ class WorldSession
         void SendPetNameInvalid(uint32 error, std::string const& name, DeclinedName *declinedName);
         void SendPartyResult(PartyOperation operation, std::string const& member, PartyResult res, uint32 val = 0);
         void SendAreaTriggerMessage(const char* Text, ...) ATTR_PRINTF(2, 3);
-        void SendSetPhaseShift(std::set<uint32> const& phaseIds, std::set<uint32> const& terrainswaps);
+        void SendSetPhaseShift(std::set<uint32> const& phaseIds, std::set<uint32> const& terrainswaps, std::set<uint32> const& worldAreas);
         void SendQueryTimeResponse();
+        void SendGroupInviteNotification(const std::string& inviterName, bool inGroup);
 
         void SendAuthResponse(uint8 code, bool queued, uint32 queuePos = 0);
         void SendClientCacheVersion(uint32 version);
@@ -301,7 +305,7 @@ class WorldSession
         void HandleClientCastFlags(WorldPacket& recvPacket, uint8 castFlags, SpellCastTargets & targets);
 
         // Pet
-        void SendPetNameQuery(uint64 guid, uint32 petnumber);
+        void SendPetNameQuery(ObjectGuid guid, uint64 petNumber);
         void SendStablePet(uint64 guid);
         void SendStablePetCallback(PreparedQueryResult result, uint64 guid);
         void SendStableResult(uint8 guid);
@@ -389,7 +393,6 @@ class WorldSession
 
         void Handle_NULL(WorldPacket& recvPacket);          // not used
         void Handle_EarlyProccess(WorldPacket& recvPacket); // just mark packets processed in WorldSocket::OnRead
-        void Handle_ServerSide(WorldPacket& recvPacket);    // sever side only, can't be accepted from client
         void Handle_Deprecated(WorldPacket& recvPacket);    // never used anymore by client
 
         void HandleCharEnumOpcode(WorldPacket& recvPacket);
@@ -465,6 +468,7 @@ class WorldSession
         void HandleGMResponseResolve(WorldPacket& recvPacket);
 
         void HandleTogglePvP(WorldPacket& recvPacket);
+        void HandleSetPvP(WorldPacket& recvPacket);
 
         void HandleZoneUpdateOpcode(WorldPacket& recvPacket);
         void HandleSetSelectionOpcode(WorldPacket& recvPacket);
@@ -523,7 +527,7 @@ class WorldSession
         void HandleGroupInviteOpcode(WorldPacket& recvPacket);
         //void HandleGroupCancelOpcode(WorldPacket& recvPacket);
         void HandleGroupInviteResponseOpcode(WorldPacket& recvPacket);
-        void HandleGroupUninviteOpcode(WorldPacket& recvPacket);
+        //void HandleGroupUninviteOpcode(WorldPacket& recvPacket);
         void HandleGroupUninviteGuidOpcode(WorldPacket& recvPacket);
         void HandleGroupSetLeaderOpcode(WorldPacket& recvPacket);
         void HandleGroupSetRolesOpcode(WorldPacket& recvData);
@@ -534,6 +538,7 @@ class WorldSession
         void HandleRequestPartyMemberStatsOpcode(WorldPacket& recvData);
         void HandleRaidTargetUpdateOpcode(WorldPacket& recvData);
         void HandleRaidReadyCheckOpcode(WorldPacket& recvData);
+        void HandleRaidReadyCheckConfirmOpcode(WorldPacket& recvData);
         void HandleRaidReadyCheckFinishedOpcode(WorldPacket& recvData);
         void HandleGroupRaidConvertOpcode(WorldPacket& recvData);
         void HandleGroupChangeSubGroupOpcode(WorldPacket& recvData);
@@ -549,6 +554,7 @@ class WorldSession
         void HandlePetitionDeclineOpcode(WorldPacket& recvData);
         void HandleOfferPetitionOpcode(WorldPacket& recvData);
         void HandleTurnInPetitionOpcode(WorldPacket& recvData);
+        void SendPetitionSignResults(ObjectGuid petitionGuid, ObjectGuid playerGuid, uint8 result);
 
         void HandleGuildQueryOpcode(WorldPacket& recvPacket);
         void HandleGuildInviteOpcode(WorldPacket& recvPacket);
@@ -576,6 +582,7 @@ class WorldSession
         void HandleSaveGuildEmblemOpcode(WorldPacket& recvPacket);
         void HandleGuildRequestPartyState(WorldPacket& recvPacket);
         void HandleGuildRequestMaxDailyXP(WorldPacket& recvPacket);
+        void HandleGuildRequestChallengeUpdate(WorldPacket& recvPacket);
         void HandleAutoDeclineGuildInvites(WorldPacket& recvPacket);
 
         void HandleGuildFinderAddRecruit(WorldPacket& recvPacket);
@@ -616,8 +623,8 @@ class WorldSession
         void HandleStableSwapPetCallback(PreparedQueryResult result, uint32 petId);
         void SendTrainerBuyFailed(uint64 guid, uint32 spellId, uint32 reason);
 
-        void HandleDuelAcceptedOpcode(WorldPacket& recvPacket);
-        void HandleDuelCancelledOpcode(WorldPacket& recvPacket);
+        void HandleDuelProposedOpcode(WorldPacket& recvPacket);
+        void HandleDuelResponseOpcode(WorldPacket& recvPacket);
 
         void HandleAcceptTradeOpcode(WorldPacket& recvPacket);
         void HandleBeginTradeOpcode(WorldPacket& recvPacket);
@@ -933,6 +940,14 @@ class WorldSession
         void HandleReforgeItemOpcode(WorldPacket& recvData);
         void SendReforgeResult(bool success);
 
+        // BlackMarket
+        void HandleBlackMarketHelloOpcode(WorldPacket& recvData);
+        void SendBlackMarketHello(uint64 guid);
+        void HandleBlackMarketRequestItemOpcode(WorldPacket& recvData);
+        void SendBlackMarketRequestItemsResult();
+        void HandleBlackMarketBidOpcode(WorldPacket& recvData);
+        void SendBlackMarketBidResult();
+
         // Miscellaneous
         void HandleSpellClick(WorldPacket& recvData);
         void HandleMirrorImageDataRequest(WorldPacket& recvData);
@@ -956,11 +971,22 @@ class WorldSession
         void HandleViolenceLevel(WorldPacket& recvPacket);
         void HandleObjectUpdateFailedOpcode(WorldPacket& recvPacket);
         void HandleRequestCategoryCooldowns(WorldPacket& recvPacket);
+
+        void SendBroadcastText(uint32 entry);
+
         int32 HandleEnableNagleAlgorithm();
 
         // Compact Unit Frames (4.x)
         void HandleSaveCUFProfiles(WorldPacket& recvPacket);
         void SendLoadCUFProfiles();
+
+        // Battle Pets
+        void HandleBattlePetDelete(WorldPacket& recvData);
+        void HandleBattlePetModifyName(WorldPacket& recvData);
+        void HandleBattlePetQueryName(WorldPacket& recvData);
+        void HandleBattlePetSetBattleSlot(WorldPacket& recvData);
+        void HandleBattlePetSetFlags(WorldPacket& recvData);
+        void HandleBattlePetSummonCompanion(WorldPacket& recvData);
 
     private:
         void InitializeQueryCallbackParameters();

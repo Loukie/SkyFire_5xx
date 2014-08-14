@@ -22,6 +22,7 @@
 #include "ArenaTeamMgr.h"
 #include "Battleground.h"
 #include "CellImpl.h"
+#include "Chat.h"
 #include "Common.h"
 #include "DatabaseEnv.h"
 #include "DBCEnums.h"
@@ -50,19 +51,11 @@ namespace Trinity
         public:
             AchievementChatBuilder(Player const& player, ChatMsg msgtype, int32 textId, uint32 ach_id)
                 : i_player(player), i_msgtype(msgtype), i_textId(textId), i_achievementId(ach_id) { }
+
             void operator()(WorldPacket& data, LocaleConstant loc_idx)
             {
-                char const* text = sObjectMgr->GetTrinityString(i_textId, loc_idx);
-
-                data << uint8(i_msgtype);
-                data << uint32(LANG_UNIVERSAL);
-                data << uint64(i_player.GetGUID());
-                data << uint32(5);
-                data << uint64(i_player.GetGUID());
-                data << uint32(strlen(text)+1);
-                data << text;
-                data << uint8(0);
-                data << uint32(i_achievementId);
+                std::string text = sObjectMgr->GetTrinityString(i_textId, loc_idx);
+                ChatHandler::BuildChatPacket(data, i_msgtype, LANG_UNIVERSAL, &i_player, &i_player, text, i_achievementId);
             }
 
         private:
@@ -71,7 +64,8 @@ namespace Trinity
             int32 i_textId;
             uint32 i_achievementId;
     };
-}                                                           // namespace Trinity
+} // namespace Trinity
+
 
 bool AchievementCriteriaData::IsValid(AchievementCriteriaEntry const* criteria)
 {
@@ -1937,71 +1931,99 @@ struct VisibleAchievementPred
 template<class T>
 void AchievementMgr<T>::SendAllAchievementData(Player* /*receiver*/) const
 {
+    /*
+     *  Temporary fix for displaying achievements! Still uses old system.
+     *  More core and database changes required for cross character achievements
+     */
+
     VisibleAchievementPred isVisible;
     size_t numCriteria = m_criteriaProgress.size();
     size_t numAchievements = std::count_if(m_completedAchievements.begin(), m_completedAchievements.end(), isVisible);
     ByteBuffer criteriaData(numCriteria * (4 + 4 + 4 + 4 + 8 + 8));
+    ByteBuffer completedData(numAchievements * (4 + 4 + 4 + 4 + 8));
     ObjectGuid guid = GetOwner()->GetGUID();
     ObjectGuid counter;
 
-    WorldPacket data(SMSG_ALL_ACHIEVEMENT_DATA, 4 + numAchievements * (4 + 4) + 4 + numCriteria * (4 + 4 + 4 + 4 + 8 + 8));
-    data.WriteBits(numCriteria, 21);
-    for (CriteriaProgressMap::const_iterator itr = m_criteriaProgress.begin(); itr != m_criteriaProgress.end(); ++itr)
-    {
-        counter = itr->second.counter;
-
-        data.WriteBit(guid[4]);
-        data.WriteBit(counter[3]);
-        data.WriteBit(guid[5]);
-        data.WriteBit(counter[0]);
-        data.WriteBit(counter[6]);
-        data.WriteBit(guid[3]);
-        data.WriteBit(guid[0]);
-        data.WriteBit(counter[4]);
-        data.WriteBit(guid[2]);
-        data.WriteBit(counter[7]);
-        data.WriteBit(guid[7]);
-        data.WriteBits(0u, 2);
-        data.WriteBit(guid[6]);
-        data.WriteBit(counter[2]);
-        data.WriteBit(counter[1]);
-        data.WriteBit(counter[5]);
-        data.WriteBit(guid[1]);
-
-        criteriaData.WriteByteSeq(guid[3]);
-        criteriaData.WriteByteSeq(counter[5]);
-        criteriaData.WriteByteSeq(counter[6]);
-        criteriaData.WriteByteSeq(guid[4]);
-        criteriaData.WriteByteSeq(guid[6]);
-        criteriaData.WriteByteSeq(counter[2]);
-        criteriaData << uint32(0); // timer 2
-        criteriaData.WriteByteSeq(guid[2]);
-        criteriaData << uint32(itr->first); // criteria id
-        criteriaData.WriteByteSeq(guid[5]);
-        criteriaData.WriteByteSeq(counter[0]);
-        criteriaData.WriteByteSeq(counter[3]);
-        criteriaData.WriteByteSeq(counter[1]);
-        criteriaData.WriteByteSeq(counter[4]);
-        criteriaData.WriteByteSeq(guid[0]);
-        criteriaData.WriteByteSeq(guid[7]);
-        criteriaData.WriteByteSeq(counter[7]);
-        criteriaData << uint32(0); // timer 1
-        criteriaData.AppendPackedTime(itr->second.date);  // criteria date
-        criteriaData.WriteByteSeq(guid[1]);
-    }
-
-    data.WriteBits(numAchievements, 23);
-    data.FlushBits();
-    data.append(criteriaData);
+    WorldPacket data(SMSG_ALL_ACHIEVEMENT_DATA, 5 + numAchievements * (1 + 4 + 4 + 4 + 4 + 8) + numCriteria * (1 + 4 + 4 + 4 + 4 + 8 + 8));
+    data.WriteBits(numAchievements, 20);
 
     for (CompletedAchievementMap::const_iterator itr = m_completedAchievements.begin(); itr != m_completedAchievements.end(); ++itr)
     {
         if (!isVisible(*itr))
             continue;
 
-        data << uint32(itr->first);
-        data.AppendPackedTime(itr->second.date);
+        data.WriteBit(guid[1]);
+        data.WriteBit(guid[6]);
+        data.WriteBit(guid[4]);
+        data.WriteBit(guid[7]);
+        data.WriteBit(guid[2]);
+        data.WriteBit(guid[5]);
+        data.WriteBit(guid[3]);
+        data.WriteBit(guid[0]);
+
+        completedData << uint32(itr->first);                    // achievement Id
+        completedData.WriteByteSeq(guid[6]);
+        completedData << uint32(0);                             // timer 1
+        completedData.WriteByteSeq(guid[2]);
+        completedData.WriteByteSeq(guid[3]);
+        completedData.AppendPackedTime(itr->second.date);       // achievement date
+        completedData << uint32(0);                             // timer 2
+        completedData.WriteByteSeq(guid[0]);
+        completedData.WriteByteSeq(guid[7]);
+        completedData.WriteByteSeq(guid[5]);
+        completedData.WriteByteSeq(guid[1]);
+        completedData.WriteByteSeq(guid[4]);
     }
+
+    data.WriteBits(numCriteria, 19);
+
+    for (CriteriaProgressMap::const_iterator itr = m_criteriaProgress.begin(); itr != m_criteriaProgress.end(); ++itr)
+    {
+        counter = itr->second.counter;
+
+        data.WriteBit(guid[1]);
+        data.WriteBit(guid[3]);
+        data.WriteBit(counter[1]);
+        data.WriteBit(counter[7]);
+        data.WriteBits(0, 4);
+        data.WriteBit(guid[4]);
+        data.WriteBit(guid[2]);
+        data.WriteBit(counter[6]);
+        data.WriteBit(guid[6]);
+        data.WriteBit(counter[2]);
+        data.WriteBit(guid[7]);
+        data.WriteBit(counter[5]);
+        data.WriteBit(guid[5]);
+        data.WriteBit(guid[0]);
+        data.WriteBit(counter[4]);
+        data.WriteBit(counter[3]);
+        data.WriteBit(counter[0]);
+
+        criteriaData.WriteByteSeq(counter[2]);
+        criteriaData.WriteByteSeq(guid[3]);
+        criteriaData.WriteByteSeq(counter[4]);
+        criteriaData.WriteByteSeq(guid[2]);
+        criteriaData.WriteByteSeq(counter[6]);
+        criteriaData.WriteByteSeq(counter[1]);
+        criteriaData.WriteByteSeq(guid[1]);
+        criteriaData << uint32(0);                              // timer 1
+        criteriaData.WriteByteSeq(counter[3]);
+        criteriaData << uint32(0);                              // timer 2
+        criteriaData.WriteByteSeq(guid[7]);
+        criteriaData.WriteByteSeq(counter[7]);
+        criteriaData.WriteByteSeq(counter[0]);
+        criteriaData.WriteByteSeq(guid[4]);
+        criteriaData.AppendPackedTime(itr->second.date);        // criteria date
+        criteriaData.WriteByteSeq(guid[0]);
+        criteriaData.WriteByteSeq(guid[5]);
+        criteriaData.WriteByteSeq(counter[5]);
+        criteriaData.WriteByteSeq(guid[6]);
+        criteriaData << uint32(itr->first);                     // criteria id
+    }
+
+    data.FlushBits();
+    data.append(criteriaData);
+    data.append(completedData);
 
     SendPacket(&data);
 }
